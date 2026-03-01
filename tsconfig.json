@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "incremental": true,
+    "paths": {
+      "@protocol-tester/shared": ["./packages/shared/src"],
+      "@protocol-tester/shared/*": ["./packages/shared/src/*"],
+      "@protocol-tester/mcp-sdk": ["./packages/mcp-sdk/src"],
+      "@protocol-tester/mcp-sdk/*": ["./packages/mcp-sdk/src/*"],
+      "@protocol-tester/a2a-sdk": ["./packages/a2a-sdk/src"],
+      "@protocol-tester/a2a-sdk/*": ["./packages/a2a-sdk/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist", ".next", "coverage"]
+}

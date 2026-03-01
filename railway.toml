@@ -1,0 +1,18 @@
+[build]
+dockerfilePath = "docker/Dockerfile"
+watchPatterns = [
+  "apps/**",
+  "packages/**",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "turbo.json",
+  "docker/**",
+]
+
+[deploy]
+startCommand = "node apps/web/server.js"
+healthcheckPath = "/"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

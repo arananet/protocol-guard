@@ -1,0 +1,11 @@
+# Default code owners
+* @edu-arana
+
+# Package owners
+/packages/mcp-sdk/ @edu-arana
+/packages/a2a-sdk/ @edu-arana
+/packages/shared/ @edu-arana
+
+# Infrastructure
+/.github/ @edu-arana
+/docker/ @edu-arana

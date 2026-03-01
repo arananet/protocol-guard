@@ -1,0 +1,121 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User Management
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  role      Role     @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys      APIKey[]
+  mcpServers   MCPServer[]
+  a2aAgents    A2AAgent[]
+  testResults  TestResult[]
+
+  @@map("users")
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+// API Keys
+model APIKey {
+  id          String    @id @default(cuid())
+  name        String
+  keyHash     String    @unique
+  prefix      String
+  expiresAt   DateTime?
+  lastUsedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("api_keys")
+}
+
+// MCP Servers
+model MCPServer {
+  id           String   @id @default(cuid())
+  name         String
+  url          String
+  authType     String   @default("none") // none, apiKey, oauth
+  apiKey       String?  // Encrypted
+  oauthClientId String?
+  capabilities String?  // JSON string
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  testResults  TestResult[]
+
+  @@map("mcp_servers")
+}
+
+// A2A Agents
+model A2AAgent {
+  id            String   @id @default(cuid())
+  name          String
+  agentCardUrl  String
+  authType      String   @default("none")
+  apiKey        String?  // Encrypted
+  oauthClientId String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  testResults   TestResult[]
+
+  @@map("a2a_agents")
+}
+
+// Test Results
+model TestResult {
+  id            String     @id @default(cuid())
+  type          TestType
+  status        TestStatus
+  passedCount   Int
+  failedCount   Int
+  warningCount  Int
+  results       Json       // Array of compliance results
+  metadata      Json?      // Additional test metadata
+  createdAt     DateTime   @default(now())
+
+  userId        String
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  mcpServerId   String?
+  mcpServer     MCPServer? @relation(fields: [mcpServerId], references: [id], onDelete: SetNull)
+
+  a2aAgentId    String?
+  a2aAgent      A2AAgent?  @relation(fields: [a2aAgentId], references: [id], onDelete: SetNull)
+
+  @@map("test_results")
+}
+
+enum TestType {
+  MCP
+  A2A
+}
+
+enum TestStatus {
+  PASSED
+  FAILED
+  WARNING
+  RUNNING
+}

@@ -3,7 +3,8 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { Navbar } from '@/components/Navbar';
-import { ChevronDown, ChevronUp, ExternalLink, Key, CheckCircle, XCircle, AlertTriangle, Info, Server, ShoppingCart, EyeOff } from 'lucide-react';
+import { AcknowledgmentGate } from '@/components/AcknowledgmentGate';
+import { ChevronDown, ChevronUp, ExternalLink, Key, CheckCircle, XCircle, AlertTriangle, Info, Server, ShoppingCart, EyeOff, Plus, Trash2 } from 'lucide-react';
 
 type AuthType = 'none' | 'bearer' | 'basic' | 'api_key';
 
@@ -34,6 +35,7 @@ export default function UCPPage() {
   const [authType, setAuthType] = useState<AuthType>('none');
   const [authValue, setAuthValue] = useState('');
   const [authHeader, setAuthHeader] = useState('Authorization');
+  const [customHeaders, setCustomHeaders] = useState<{ key: string; value: string }[]>([]);
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState<ComplianceReport | null>(null);
   const [error, setError] = useState('');
@@ -49,7 +51,7 @@ export default function UCPPage() {
       const response = await fetch('/api/ucp/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint, authType, authValue, authHeader }),
+        body: JSON.stringify({ endpoint, authType, authValue, authHeader, customHeaders: customHeaders.filter(h => h.key && h.value) }),
       });
 
       if (!response.ok) {
@@ -87,6 +89,7 @@ export default function UCPPage() {
     <div className="min-h-screen bg-background flex flex-col">
       <Navbar />
 
+      <AcknowledgmentGate>
       <main className="flex-1 container mx-auto px-4 py-8">
         <div className="max-w-3xl mx-auto">
           <div className="mb-8">
@@ -176,6 +179,55 @@ export default function UCPPage() {
                   />
                 </div>
               )}
+            </div>
+
+            {/* Custom Headers Section */}
+            <div className="p-5 border rounded-lg bg-muted/30">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-medium">Custom Headers (optional)</h3>
+                <button
+                  onClick={() => setCustomHeaders([...customHeaders, { key: '', value: '' }])}
+                  className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Header
+                </button>
+              </div>
+              {customHeaders.length === 0 && (
+                <p className="text-xs text-muted-foreground">No custom headers. Click &quot;Add Header&quot; to include extra HTTP headers with every request.</p>
+              )}
+              {customHeaders.map((header, idx) => (
+                <div key={idx} className="flex items-center gap-2 mb-2">
+                  <input
+                    type="text"
+                    value={header.key}
+                    onChange={(e) => {
+                      const updated = [...customHeaders];
+                      updated[idx] = { ...updated[idx], key: e.target.value };
+                      setCustomHeaders(updated);
+                    }}
+                    placeholder="Header name"
+                    className="flex-1 px-3 py-2 text-sm border rounded-lg bg-background focus:ring-2 focus:ring-primary focus:border-primary"
+                  />
+                  <input
+                    type="text"
+                    value={header.value}
+                    onChange={(e) => {
+                      const updated = [...customHeaders];
+                      updated[idx] = { ...updated[idx], value: e.target.value };
+                      setCustomHeaders(updated);
+                    }}
+                    placeholder="Header value"
+                    className="flex-1 px-3 py-2 text-sm border rounded-lg bg-background focus:ring-2 focus:ring-primary focus:border-primary"
+                  />
+                  <button
+                    onClick={() => setCustomHeaders(customHeaders.filter((_, i) => i !== idx))}
+                    className="p-2 text-muted-foreground hover:text-red-500 transition-colors"
+                    title="Remove header"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
             </div>
 
             <button
@@ -329,6 +381,7 @@ export default function UCPPage() {
           </div>
         </div>
       </footer>
+      </AcknowledgmentGate>
     </div>
   );
 }

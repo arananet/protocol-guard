@@ -360,7 +360,7 @@ function analyzeCapabilities(card: AgentCard): Finding[] {
 
 // ─── Agent Card Fetching ─────────────────────────────────────────────────────
 
-async function fetchAgentCard(url: string): Promise<{ card: AgentCard; resolvedUrl: string }> {
+async function fetchAgentCard(url: string, headers: Record<string, string> = {}): Promise<{ card: AgentCard; resolvedUrl: string }> {
   const attempts = [
     url,
     url.replace(/\/$/, '') + '/.well-known/agent.json',
@@ -373,7 +373,7 @@ async function fetchAgentCard(url: string): Promise<{ card: AgentCard; resolvedU
     try {
       const res = await fetch(attempt, {
         method: 'GET',
-        headers: { 'Accept': 'application/json' },
+        headers: { 'Accept': 'application/json', ...headers },
       });
       if (res.ok) {
         const data = await res.json();
@@ -389,11 +389,11 @@ async function fetchAgentCard(url: string): Promise<{ card: AgentCard; resolvedU
 
 // ─── Security Headers Check ──────────────────────────────────────────────────
 
-async function analyzeSecurityHeaders(url: string): Promise<Finding[]> {
+async function analyzeSecurityHeaders(url: string, extraHeaders: Record<string, string> = {}): Promise<Finding[]> {
   const findings: Finding[] = [];
 
   try {
-    const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+    const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json', ...extraHeaders } });
     const headers = res.headers;
 
     const securityHeaders: { name: string; severity: Severity; description: string }[] = [
@@ -447,7 +447,7 @@ async function analyzeSecurityHeaders(url: string): Promise<Finding[]> {
 
 // ─── Endpoint Probe ──────────────────────────────────────────────────────────
 
-async function probeEndpoint(card: AgentCard): Promise<Finding[]> {
+async function probeEndpoint(card: AgentCard, extraHeaders: Record<string, string> = {}): Promise<Finding[]> {
   const findings: Finding[] = [];
   const agentUrl = card.url;
   if (!agentUrl) return findings;
@@ -456,7 +456,7 @@ async function probeEndpoint(card: AgentCard): Promise<Finding[]> {
     // Try sending a minimal tasks/send to see if the agent validates properly
     const res = await fetch(agentUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...extraHeaders },
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: 'security-probe-1',
@@ -505,10 +505,29 @@ async function probeEndpoint(card: AgentCard): Promise<Finding[]> {
 
 export async function POST(request: NextRequest) {
   try {
-    const { agentUrl } = await request.json();
+    const { agentUrl, authType, authValue, authHeader, customHeaders } = await request.json();
 
     if (!agentUrl) {
       return NextResponse.json({ error: 'Agent URL required' }, { status: 400 });
+    }
+
+    // Build auth headers
+    const reqHeaders: Record<string, string> = {};
+    if (authType && authType !== 'none' && authValue) {
+      if (authType === 'api_key') {
+        reqHeaders[authHeader || 'Authorization'] = authValue;
+      } else if (authType === 'bearer') {
+        reqHeaders[authHeader || 'Authorization'] = `Bearer ${authValue}`;
+      } else if (authType === 'basic') {
+        reqHeaders[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+      }
+    }
+
+    // Apply custom headers
+    if (Array.isArray(customHeaders)) {
+      for (const h of customHeaders) {
+        if (h.key && h.value) reqHeaders[h.key] = h.value;
+      }
     }
 
     // Fetch agent card
@@ -516,7 +535,7 @@ export async function POST(request: NextRequest) {
     let resolvedUrl: string;
 
     try {
-      const result = await fetchAgentCard(agentUrl);
+      const result = await fetchAgentCard(agentUrl, reqHeaders);
       card = result.card;
       resolvedUrl = result.resolvedUrl;
     } catch {
@@ -544,8 +563,8 @@ export async function POST(request: NextRequest) {
     findings.push(...analyzeSecretLeakage(card));
     findings.push(...analyzeProviderInfo(card));
     findings.push(...analyzeCapabilities(card));
-    findings.push(...await analyzeSecurityHeaders(resolvedUrl));
-    findings.push(...await probeEndpoint(card));
+    findings.push(...await analyzeSecurityHeaders(resolvedUrl, reqHeaders));
+    findings.push(...await probeEndpoint(card, reqHeaders));
 
     const summary = {
       critical: findings.filter(f => f.severity === 'critical').length,

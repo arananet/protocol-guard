@@ -353,7 +353,7 @@ function runComplianceChecks(profile: Record<string, unknown>): ComplianceResult
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { endpoint, authType, authValue, authHeader } = body;
+    const { endpoint, authType, authValue, authHeader, customHeaders } = body;
 
     if (!endpoint) {
       return NextResponse.json({ error: 'Endpoint URL required' }, { status: 400 });
@@ -374,6 +374,13 @@ export async function POST(request: NextRequest) {
       headers[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
     } else if (authType === 'api_key' && authValue) {
       headers[authHeader || 'X-API-Key'] = authValue;
+    }
+
+    // Apply custom headers
+    if (Array.isArray(customHeaders)) {
+      for (const h of customHeaders) {
+        if (h.key && h.value) headers[h.key] = h.value;
+      }
     }
 
     // ── Fetch the UCP Business Profile from /.well-known/ucp ─────────

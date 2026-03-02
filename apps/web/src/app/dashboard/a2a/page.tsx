@@ -3,9 +3,10 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { Navbar } from '@/components/Navbar';
+import { AcknowledgmentGate } from '@/components/AcknowledgmentGate';
 import {
   ChevronDown, ChevronUp, ExternalLink, Globe, CheckCircle, XCircle,
-  AlertTriangle, Info, Shield, Play, Zap, MessageSquare, Loader2, EyeOff,
+  AlertTriangle, Info, Shield, Play, Zap, MessageSquare, Loader2, EyeOff, Plus, Trash2,
 } from 'lucide-react';
 
 type AuthType = 'none' | 'bearer' | 'basic' | 'api_key';
@@ -105,6 +106,7 @@ export default function A2APage() {
   const [authType, setAuthType] = useState<AuthType>('none');
   const [authValue, setAuthValue] = useState('');
   const [authHeader, setAuthHeader] = useState('Authorization');
+  const [customHeaders, setCustomHeaders] = useState<{ key: string; value: string }[]>([]);
 
   // Compliance state
   const [loading, setLoading] = useState(false);
@@ -141,7 +143,7 @@ export default function A2APage() {
       const response = await fetch('/api/a2a/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentCardUrl, authType, authValue, authHeader }),
+        body: JSON.stringify({ agentCardUrl, authType, authValue, authHeader, customHeaders: customHeaders.filter(h => h.key && h.value) }),
       });
 
       if (!response.ok) throw new Error('Failed to fetch or validate agent card');
@@ -167,7 +169,7 @@ export default function A2APage() {
       const res = await fetch('/api/a2a/agent-card', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentUrl: agentCardUrl, authType, authValue, authHeader }),
+        body: JSON.stringify({ agentUrl: agentCardUrl, authType, authValue, authHeader, customHeaders: customHeaders.filter(h => h.key && h.value) }),
       });
 
       const data = await res.json();
@@ -206,6 +208,7 @@ export default function A2APage() {
           authType,
           authValue,
           authHeader,
+          customHeaders: customHeaders.filter(h => h.key && h.value),
           message: taskMessage,
         }),
       });
@@ -232,7 +235,7 @@ export default function A2APage() {
       const response = await fetch('/api/a2a/security', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentUrl: agentCardUrl }),
+        body: JSON.stringify({ agentUrl: agentCardUrl, authType, authValue, authHeader, customHeaders: customHeaders.filter(h => h.key && h.value) }),
       });
 
       const data = await response.json();
@@ -286,6 +289,7 @@ export default function A2APage() {
     <div className="min-h-screen bg-background flex flex-col">
       <Navbar />
 
+      <AcknowledgmentGate>
       <main className="flex-1 container mx-auto px-4 py-8">
         <div className="max-w-3xl mx-auto">
           {/* Header */}
@@ -383,6 +387,55 @@ export default function A2APage() {
                   />
                 </div>
               )}
+            </div>
+
+            {/* Custom Headers Section */}
+            <div className="p-5 border rounded-lg bg-muted/30">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-medium">Custom Headers (optional)</h3>
+                <button
+                  onClick={() => setCustomHeaders([...customHeaders, { key: '', value: '' }])}
+                  className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Header
+                </button>
+              </div>
+              {customHeaders.length === 0 && (
+                <p className="text-xs text-muted-foreground">No custom headers. Click &quot;Add Header&quot; to include extra HTTP headers with every request.</p>
+              )}
+              {customHeaders.map((header, idx) => (
+                <div key={idx} className="flex items-center gap-2 mb-2">
+                  <input
+                    type="text"
+                    value={header.key}
+                    onChange={(e) => {
+                      const updated = [...customHeaders];
+                      updated[idx] = { ...updated[idx], key: e.target.value };
+                      setCustomHeaders(updated);
+                    }}
+                    placeholder="Header name"
+                    className="flex-1 px-3 py-2 text-sm border rounded-lg bg-background focus:ring-2 focus:ring-primary focus:border-primary"
+                  />
+                  <input
+                    type="text"
+                    value={header.value}
+                    onChange={(e) => {
+                      const updated = [...customHeaders];
+                      updated[idx] = { ...updated[idx], value: e.target.value };
+                      setCustomHeaders(updated);
+                    }}
+                    placeholder="Header value"
+                    className="flex-1 px-3 py-2 text-sm border rounded-lg bg-background focus:ring-2 focus:ring-primary focus:border-primary"
+                  />
+                  <button
+                    onClick={() => setCustomHeaders(customHeaders.filter((_, i) => i !== idx))}
+                    className="p-2 text-muted-foreground hover:text-red-500 transition-colors"
+                    title="Remove header"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
             </div>
           </div>
 
@@ -816,6 +869,7 @@ export default function A2APage() {
           </div>
         </div>
       </footer>
+      </AcknowledgmentGate>
     </div>
   );
 }

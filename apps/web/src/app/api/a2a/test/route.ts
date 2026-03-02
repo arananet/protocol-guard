@@ -103,7 +103,7 @@ async function fetchAgentCard(
 
 export async function POST(request: NextRequest) {
   try {
-    const { agentCardUrl, authType, authValue, authHeader } = await request.json();
+    const { agentCardUrl, authType, authValue, authHeader, customHeaders } = await request.json();
 
     if (!agentCardUrl) {
       return NextResponse.json({ error: 'Agent Card URL required' }, { status: 400 });
@@ -118,6 +118,13 @@ export async function POST(request: NextRequest) {
         headers[authHeader || 'Authorization'] = `Bearer ${authValue}`;
       } else if (authType === 'basic') {
         headers[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+      }
+    }
+
+    // Apply custom headers
+    if (Array.isArray(customHeaders)) {
+      for (const h of customHeaders) {
+        if (h.key && h.value) headers[h.key] = h.value;
       }
     }
 

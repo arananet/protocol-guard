@@ -11,18 +11,20 @@
  *   node scan.mjs --type a2a --url https://your-a2a-agent.com/
  *   node scan.mjs --type mcp --url https://server.com/mcp --auth bearer --token YOUR_TOKEN
  *   node scan.mjs --type mcp --url https://server.com/mcp --fail-on high
+ *   node scan.mjs --type mcp --url https://server.com/mcp --custom-header "X-Org-Id:123" --custom-header "X-Env:prod"
  *
  * Options:
- *   --type       Scan type: "mcp" or "a2a" (required)
- *   --url        Target server/agent URL (required)
- *   --auth       Auth type: none, bearer, api_key, basic (default: none)
- *   --token      Auth token/value
- *   --header     Auth header name (default: Authorization)
- *   --fail-on    Exit with code 1 if findings at this severity or above
- *                are found. Values: critical, high, medium, low, info (default: none)
- *   --json       Output raw JSON instead of formatted text
- *   --base-url   Protocol Guard instance URL (default: http://localhost:3000)
- *   --help       Show this help message
+ *   --type            Scan type: "mcp" or "a2a" (required)
+ *   --url             Target server/agent URL (required)
+ *   --auth            Auth type: none, bearer, api_key, basic (default: none)
+ *   --token           Auth token/value
+ *   --header          Auth header name (default: Authorization)
+ *   --custom-header   Extra header as "Key:Value" (repeatable)
+ *   --fail-on         Exit with code 1 if findings at this severity or above
+ *                     are found. Values: critical, high, medium, low, info (default: none)
+ *   --json            Output raw JSON instead of formatted text
+ *   --base-url        Protocol Guard instance URL (default: http://localhost:3000)
+ *   --help            Show this help message
  *
  * Exit codes:
  *   0  Scan completed, no findings above threshold
@@ -38,16 +40,30 @@ const SEVERITY_ORDER = ['info', 'low', 'medium', 'high', 'critical'];
 
 function parseArgs(argv) {
   const args = {};
+  const customHeaders = [];
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') {
       args.help = true;
     } else if (arg === '--json') {
       args.json = true;
+    } else if (arg === '--custom-header') {
+      const val = argv[++i];
+      if (val) {
+        const colonIdx = val.indexOf(':');
+        if (colonIdx > 0) {
+          customHeaders.push({ key: val.slice(0, colonIdx).trim(), value: val.slice(colonIdx + 1).trim() });
+        } else {
+          console.error(`Warning: ignoring malformed --custom-header "${val}" (expected Key:Value)`);
+        }
+      }
     } else if (arg.startsWith('--')) {
       const key = arg.replace(/^--/, '').replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       args[key] = argv[++i];
     }
+  }
+  if (customHeaders.length > 0) {
+    args.customHeaders = customHeaders;
   }
   return args;
 }
@@ -60,16 +76,17 @@ Usage:
   node scan.mjs --type <mcp|a2a> --url <target-url> [options]
 
 Options:
-  --type       Scan type: "mcp" or "a2a" (required)
-  --url        Target server/agent URL (required)
-  --auth       Auth type: none, bearer, api_key, basic (default: none)
-  --token      Auth token/value
-  --header     Auth header name (default: Authorization)
-  --fail-on    Fail if findings at this severity or above exist
-               Values: critical, high, medium, low, info (default: none — never fail)
-  --json       Output raw JSON instead of formatted text
-  --base-url   Protocol Guard instance URL (default: http://localhost:3000)
-  --help       Show this help message
+  --type            Scan type: "mcp" or "a2a" (required)
+  --url             Target server/agent URL (required)
+  --auth            Auth type: none, bearer, api_key, basic (default: none)
+  --token           Auth token/value
+  --header          Auth header name (default: Authorization)
+  --custom-header   Extra header as "Key:Value" (repeatable)
+  --fail-on         Fail if findings at this severity or above exist
+                    Values: critical, high, medium, low, info (default: none — never fail)
+  --json            Output raw JSON instead of formatted text
+  --base-url        Protocol Guard instance URL (default: http://localhost:3000)
+  --help            Show this help message
 
 Examples:
   # Scan an MCP server
@@ -80,6 +97,9 @@ Examples:
 
   # Fail CI if any high or critical findings
   node scan.mjs --type mcp --url https://mcp.example.com/mcp --fail-on high
+
+  # Add custom headers to the scan
+  node scan.mjs --type mcp --url https://mcp.example.com/mcp --custom-header "X-Org-Id:123" --custom-header "X-Env:prod"
 
   # Output JSON for programmatic consumption
   node scan.mjs --type mcp --url https://mcp.example.com/mcp --json
@@ -163,9 +183,14 @@ async function runScan(args) {
         authType: args.auth || 'none',
         authValue: args.token || '',
         authHeader: args.header || 'Authorization',
+        customHeaders: args.customHeaders || [],
       }
     : {
         agentUrl: args.url,
+        authType: args.auth || 'none',
+        authValue: args.token || '',
+        authHeader: args.header || 'Authorization',
+        customHeaders: args.customHeaders || [],
       };
 
   const response = await fetch(url, {

@@ -649,7 +649,7 @@ function analyzeCrossToolViolations(tools: MCPTool[]): Finding[] {
 
 export async function POST(request: NextRequest) {
   try {
-    const { serverUrl, authType, authValue, authHeader } = await request.json();
+    const { serverUrl, authType, authValue, authHeader, customHeaders } = await request.json();
 
     if (!serverUrl) {
       return NextResponse.json({ error: 'Server URL required' }, { status: 400 });
@@ -667,6 +667,13 @@ export async function POST(request: NextRequest) {
         reqHeaders[authHeader || 'Authorization'] = `Bearer ${authValue}`;
       } else if (authType === 'basic') {
         reqHeaders[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+      }
+    }
+
+    // Apply custom headers
+    if (Array.isArray(customHeaders)) {
+      for (const h of customHeaders) {
+        if (h.key && h.value) reqHeaders[h.key] = h.value;
       }
     }
 

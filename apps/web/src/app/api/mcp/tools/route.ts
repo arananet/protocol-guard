@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
  */
 export async function POST(request: NextRequest) {
   try {
-    const { serverUrl, authType, authValue, authHeader } = await request.json();
+    const { serverUrl, authType, authValue, authHeader, customHeaders } = await request.json();
 
     if (!serverUrl) {
       return NextResponse.json({ error: 'Server URL required' }, { status: 400 });
@@ -23,6 +23,13 @@ export async function POST(request: NextRequest) {
         headers[authHeader || 'Authorization'] = `Bearer ${authValue}`;
       } else if (authType === 'basic') {
         headers[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+      }
+    }
+
+    // Apply custom headers
+    if (Array.isArray(customHeaders)) {
+      for (const h of customHeaders) {
+        if (h.key && h.value) headers[h.key] = h.value;
       }
     }
 

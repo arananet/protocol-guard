@@ -232,6 +232,7 @@ export async function POST(request: NextRequest) {
       let passed = false;
       let message = '';
       let docUrl = '';
+      let note = '';
 
       switch (rule.id) {
         case 'protocol-version':
@@ -300,6 +301,7 @@ export async function POST(request: NextRequest) {
             passed = true;
             message = `No authentication configured`;
             docUrl = MCP_SPEC.urls.authentication;
+            note = `The MCP spec does not mandate authentication but strongly recommends it for any non-local deployment. Running without auth means any client can connect and invoke all tools. Standards guidance: OWASP MCP Top 10 — MCP07 (Insufficient Authentication & Authorization) flags unauthenticated servers as a high-risk finding. MSSS MCP-AUTHZ-01 (L3) requires OAuth 2.1 delegation for production and internet-facing servers. Consider adding Bearer token auth at minimum for team/internal use, or OAuth 2.1 for production.`;
           } else if (authTested) {
             passed = authPassed;
             if (authPassed) {
@@ -315,7 +317,7 @@ export async function POST(request: NextRequest) {
           break;
       }
 
-      return { passed, ruleId: rule.id, message, severity: rule.severity, docUrl: docUrl || undefined };
+      return { passed, ruleId: rule.id, message, severity: rule.severity, docUrl: docUrl || undefined, note: note || undefined };
     });
 
     const passedCount = results.filter((r) => r.passed).length;

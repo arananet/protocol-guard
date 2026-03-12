@@ -20,6 +20,7 @@ interface ComplianceResult {
   message: string;
   severity: 'critical' | 'warning' | 'info';
   docUrl?: string;
+  note?: string;
 }
 
 interface ComplianceReport {
@@ -65,6 +66,8 @@ interface SecurityFinding {
   owaspId: string;
   owaspTitle: string;
   owaspUrl: string;
+  msssId?: string;
+  msssLevel?: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
   category: string;
   title: string;
@@ -81,6 +84,14 @@ interface OWASPCoverage {
   checked: boolean;
 }
 
+interface MSSControl {
+  id: string;
+  level: string;
+  title: string;
+  findingsCount: number;
+  checked: boolean;
+}
+
 interface SecurityReport {
   timestamp: string;
   serverUrl: string;
@@ -88,7 +99,8 @@ interface SecurityReport {
   toolsCount: number;
   findings: SecurityFinding[];
   summary: { critical: number; high: number; medium: number; low: number; info: number; total: number };
-  owaspCoverage: OWASPCoverage[];
+  owaspCoverage?: OWASPCoverage[];
+  msssControls?: MSSControl[];
   raw: unknown;
 }
 
@@ -123,6 +135,8 @@ export default function MCPPage() {
   const [scanReport, setScanReport] = useState<SecurityReport | null>(null);
   const [scanError, setScanError] = useState('');
   const [showScanRaw, setShowScanRaw] = useState(false);
+  const [expandedOwaspId, setExpandedOwaspId] = useState<string | null>(null);
+  const [expandedMsssId, setExpandedMsssId] = useState<string | null>(null);
 
   // ─── Compliance Test ─────────────────────────────────────────────────────
 
@@ -533,6 +547,12 @@ export default function MCPPage() {
                           {getSeverityBadge(result.severity, result.passed)}
                         </div>
                         <p className="text-sm text-muted-foreground mt-2 ml-7">{result.message}</p>
+                        {result.note && (
+                          <div className="mt-2 ml-7 flex gap-2 px-3 py-2.5 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-300/50 dark:border-amber-700/40">
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                            <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">{result.note}</p>
+                          </div>
+                        )}
                         {result.docUrl && (
                           <div className="mt-3 ml-7 flex items-center gap-2 px-3 py-2 rounded-md bg-muted/50 border border-border/50 w-fit">
                             <ExternalLink className="w-3.5 h-3.5 text-primary flex-shrink-0" />
@@ -767,21 +787,130 @@ export default function MCPPage() {
                       <h4 className="font-medium">OWASP MCP Top 10 Coverage</h4>
                     </div>
                     <div className="divide-y">
-                      {scanReport.owaspCoverage.map((item) => (
-                        <div key={item.id} className="flex items-center justify-between p-3 hover:bg-muted/30">
-                          <div className="flex items-center gap-3">
-                            <span className="font-mono text-xs font-bold text-primary w-14">{item.id}</span>
-                            <a href={item.url} target="_blank" rel="noopener noreferrer" className="text-sm hover:text-primary hover:underline">
-                              {item.title}
-                            </a>
+                      {(scanReport.owaspCoverage ?? []).map((item) => {
+                        const related = scanReport.findings.filter(f => f.owaspId === item.id);
+                        const isOpen = expandedOwaspId === item.id;
+                        return (
+                          <div key={item.id}>
+                            <button
+                              onClick={() => related.length > 0 && setExpandedOwaspId(isOpen ? null : item.id)}
+                              className={`w-full flex items-center justify-between p-3 text-left transition-colors ${
+                                related.length > 0 ? 'hover:bg-muted/50 cursor-pointer' : 'cursor-default'
+                              } ${isOpen ? 'bg-muted/40' : ''}`}
+                            >
+                              <div className="flex items-center gap-3">
+                                <span className="font-mono text-xs font-bold text-primary w-14">{item.id}</span>
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-sm hover:text-primary hover:underline"
+                                  onClick={e => e.stopPropagation()}
+                                >
+                                  {item.title}
+                                </a>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className={`text-xs font-mono ${item.findingsCount > 0 ? 'text-red-600 dark:text-red-400 font-bold' : 'text-green-600 dark:text-green-400'}`}>
+                                  {item.findingsCount > 0 ? `${item.findingsCount} finding${item.findingsCount > 1 ? 's' : ''}` : 'Clean'}
+                                </span>
+                                {related.length > 0 && (
+                                  isOpen ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
+                                )}
+                              </div>
+                            </button>
+                            {isOpen && (
+                              <div className="border-t bg-background divide-y">
+                                {related.map((f, i) => (
+                                  <div key={i} className={`px-4 py-3 border-l-4 ${
+                                    f.severity === 'critical' ? 'border-l-red-500' :
+                                    f.severity === 'high' ? 'border-l-orange-500' :
+                                    f.severity === 'medium' ? 'border-l-yellow-500' :
+                                    f.severity === 'low' ? 'border-l-blue-400' : 'border-l-border'
+                                  }`}>
+                                    <div className="flex items-center justify-between mb-1">
+                                      <div className="flex items-center gap-2">
+                                        {f.toolName && <span className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">🔧 {f.toolName}</span>}
+                                        <span className="text-xs text-muted-foreground">{f.category}</span>
+                                      </div>
+                                      {getSecurityBadge(f.severity)}
+                                    </div>
+                                    <p className="text-sm font-medium">{f.title}</p>
+                                    <p className="text-xs text-muted-foreground mt-0.5">{f.description}</p>
+                                    {f.evidence && <p className="text-xs font-mono bg-muted px-2 py-1 rounded mt-1">Evidence: {f.evidence}</p>}
+                                    {f.msssId && <span className="inline-flex items-center gap-1 text-xs text-muted-foreground border rounded px-1.5 py-0.5 font-mono mt-1">MSSS {f.msssId} <span className="bg-muted rounded px-1">{f.msssLevel}</span></span>}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                          <span className={`text-xs font-mono ${item.findingsCount > 0 ? 'text-red-600 dark:text-red-400 font-bold' : 'text-green-600 dark:text-green-400'}`}>
-                            {item.findingsCount > 0 ? `${item.findingsCount} finding${item.findingsCount > 1 ? 's' : ''}` : 'Clean'}
-                          </span>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
+
+                  {/* MSSS Controls Coverage */}
+                  {scanReport.msssControls && scanReport.msssControls.length > 0 && (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="p-4 bg-muted">
+                        <h4 className="font-medium">MSSS v0.1 Control Coverage</h4>
+                        <p className="text-xs text-muted-foreground mt-0.5">MCP Server Security Standard — remotely-detectable controls</p>
+                      </div>
+                      <div className="divide-y">
+                        {scanReport.msssControls.map((ctrl) => {
+                          const related = scanReport.findings.filter(f => f.msssId === ctrl.id);
+                          const isOpen = expandedMsssId === ctrl.id;
+                          return (
+                            <div key={ctrl.id}>
+                              <button
+                                onClick={() => related.length > 0 && setExpandedMsssId(isOpen ? null : ctrl.id)}
+                                className={`w-full flex items-center justify-between p-3 text-left transition-colors ${
+                                  related.length > 0 ? 'hover:bg-muted/50 cursor-pointer' : 'cursor-default'
+                                } ${isOpen ? 'bg-muted/40' : ''}`}
+                              >
+                                <div className="flex items-center gap-3">
+                                  <span className="font-mono text-xs font-bold text-primary w-28">{ctrl.id}</span>
+                                  <span className="text-xs px-1.5 py-0.5 rounded bg-muted border font-mono text-muted-foreground">{ctrl.level}</span>
+                                  <span className="text-sm">{ctrl.title}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className={`text-xs font-mono ${ctrl.findingsCount > 0 ? 'text-red-600 dark:text-red-400 font-bold' : 'text-green-600 dark:text-green-400'}`}>
+                                    {ctrl.findingsCount > 0 ? `${ctrl.findingsCount} finding${ctrl.findingsCount > 1 ? 's' : ''}` : 'Clean'}
+                                  </span>
+                                  {related.length > 0 && (
+                                    isOpen ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
+                                  )}
+                                </div>
+                              </button>
+                              {isOpen && (
+                                <div className="border-t bg-background divide-y">
+                                  {related.map((f, i) => (
+                                    <div key={i} className={`px-4 py-3 border-l-4 ${
+                                      f.severity === 'critical' ? 'border-l-red-500' :
+                                      f.severity === 'high' ? 'border-l-orange-500' :
+                                      f.severity === 'medium' ? 'border-l-yellow-500' :
+                                      f.severity === 'low' ? 'border-l-blue-400' : 'border-l-border'
+                                    }`}>
+                                      <div className="flex items-center justify-between mb-1">
+                                        <div className="flex items-center gap-2">
+                                          {f.toolName && <span className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">🔧 {f.toolName}</span>}
+                                          <span className="text-xs text-muted-foreground">{f.category}</span>
+                                        </div>
+                                        {getSecurityBadge(f.severity)}
+                                      </div>
+                                      <p className="text-sm font-medium">{f.title}</p>
+                                      <p className="text-xs text-muted-foreground mt-0.5">{f.description}</p>
+                                      {f.evidence && <p className="text-xs font-mono bg-muted px-2 py-1 rounded mt-1">Evidence: {f.evidence}</p>}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
 
                   {/* Findings */}
                   {scanReport.findings.length > 0 && (
@@ -818,9 +947,17 @@ export default function MCPPage() {
                               Tool: <span className="font-mono">{finding.toolName}</span>
                             </div>
                           )}
-                          <a href={finding.owaspUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 mt-2 text-xs text-primary hover:underline">
-                            OWASP Reference <ExternalLink className="w-3 h-3" />
-                          </a>
+                          <div className="flex items-center gap-3 mt-2">
+                            <a href={finding.owaspUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                              OWASP Reference <ExternalLink className="w-3 h-3" />
+                            </a>
+                            {finding.msssId && (
+                              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground border rounded px-1.5 py-0.5 font-mono">
+                                MSSS {finding.msssId}
+                                {finding.msssLevel && <span className="bg-muted rounded px-1">{finding.msssLevel}</span>}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       ))}
                     </div>

@@ -25,6 +25,19 @@ See [LICENSE](LICENSE) for the full license text.
 
 ### Security Scanning
 - **MCP OWASP Top 10 Scanner** — detects all 10 [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/) vulnerability categories (MCP01–MCP10) including tool poisoning, command injection, privilege escalation, and context injection. Detection patterns inspired by [mcp-shield](https://github.com/riseandignite/mcp-shield).
+- **MCP MSSS v0.1 Coverage** — layered on top of the OWASP scan, each finding is cross-referenced against the [MCP Server Security Standard (MSSS)](https://github.com/mcp-security-standard/mcp-server-security-standard) where applicable. The scanner evaluates the following remotely-detectable controls:
+
+  | Control | Level | What is checked |
+  |---------|-------|-----------------|
+  | `MCP-INPUT-01` | L1 | Tools missing `inputSchema` or with `additionalProperties` not set to `false` (schema poisoning risk) |
+  | `MCP-INPUT-02` | L2 | String parameters without `maxLength` and arrays without `maxItems` (DoS / ReDoS risk) |
+  | `MCP-NET-01` | L1 | URL-type parameters (`url`, `endpoint`, `webhook`, …) with no `pattern`/`enum` constraint (SSRF risk) |
+  | `MCP-FS-01` | L1 | Path/file parameters without a `pattern` constraint (path traversal risk) |
+  | `MCP-FS-02` | L1 | Symlink/readlink references in tool descriptions (symlink traversal risk) |
+  | `MCP-EXEC-03` | L2 | Command/argument parameters without an `enum` allowlist (argument injection risk) |
+
+  Each finding that maps to a MSSS control includes `msssId` and `msssLevel` fields. The scan response also includes a `msssControls` coverage block alongside the existing `owaspCoverage` block.
+
 - **A2A Security Scanner** — 8-category analysis covering spec compliance, authentication, transport security, injection risks, secret leakage, and security headers. Scan approach inspired by [a2a-scanner](https://github.com/cisco-ai-defense/a2a-scanner).
 
 ### Privacy
@@ -220,6 +233,7 @@ Protocol Guard's security scanners are built on the shoulders of these projects 
 | Reference | Description |
 |-----------|-------------|
 | [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/) | The vulnerability taxonomy used by the MCP security scanner. Each finding maps to an OWASP category (MCP01–MCP10). |
+| [MCP Server Security Standard (MSSS) v0.1](https://github.com/mcp-security-standard/mcp-server-security-standard) | 24 security controls across 8 domains (Filesystem, Execution, Network, Authorization, Input Validation, Logging, Supply Chain, Deployment). Protocol Guard implements the remotely-detectable subset (MCP-INPUT-01/02, MCP-NET-01, MCP-FS-01/02, MCP-EXEC-03) and cross-references every applicable finding with its control ID and compliance level (L1–L4). |
 | [mcp-shield](https://github.com/riseandignite/mcp-shield) | Inspired the detection patterns for tool poisoning, hidden instructions, data exfiltration, and command injection analysis. |
 | [a2a-scanner](https://github.com/cisco-ai-defense/a2a-scanner) | Inspired the A2A security scan approach: agent card validation, authentication posture, endpoint probing, and header analysis. |
 | [MCP Specification](https://modelcontextprotocol.io/) | The official Model Context Protocol specification used for compliance testing. |

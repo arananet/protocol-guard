@@ -130,6 +130,7 @@ export default function A2APage() {
   const [scanReport, setScanReport] = useState<SecurityReport | null>(null);
   const [scanError, setScanError] = useState('');
   const [showScanRaw, setShowScanRaw] = useState(false);
+  const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   // ─── Compliance Test ─────────────────────────────────────────────────────
 
@@ -792,14 +793,51 @@ export default function A2APage() {
                         <h4 className="font-medium">Categories Analyzed</h4>
                       </div>
                       <div className="divide-y">
-                        {scanReport.categories.map((cat) => (
-                          <div key={cat.name} className="flex items-center justify-between p-3">
-                            <span className="text-sm">{cat.name}</span>
-                            <span className={`text-xs font-mono ${cat.count > 0 ? 'text-red-600 dark:text-red-400 font-bold' : 'text-green-600 dark:text-green-400'}`}>
-                              {cat.count} finding{cat.count !== 1 ? 's' : ''}
-                            </span>
-                          </div>
-                        ))}
+                        {scanReport.categories.map((cat) => {
+                          const related = scanReport.findings.filter(f => f.category === cat.name);
+                          const isOpen = expandedCategory === cat.name;
+                          return (
+                            <div key={cat.name}>
+                              <button
+                                onClick={() => related.length > 0 && setExpandedCategory(isOpen ? null : cat.name)}
+                                className={`w-full flex items-center justify-between p-3 text-left transition-colors ${
+                                  related.length > 0 ? 'hover:bg-muted/50 cursor-pointer' : 'cursor-default'
+                                } ${isOpen ? 'bg-muted/40' : ''}`}
+                              >
+                                <span className="text-sm">{cat.name}</span>
+                                <div className="flex items-center gap-2">
+                                  <span className={`text-xs font-mono ${cat.count > 0 ? 'text-red-600 dark:text-red-400 font-bold' : 'text-green-600 dark:text-green-400'}`}>
+                                    {cat.count} finding{cat.count !== 1 ? 's' : ''}
+                                  </span>
+                                  {related.length > 0 && (
+                                    isOpen ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
+                                  )}
+                                </div>
+                              </button>
+                              {isOpen && (
+                                <div className="border-t bg-background divide-y">
+                                  {related.map((f, i) => (
+                                    <div key={i} className={`px-4 py-3 border-l-4 ${
+                                      f.severity === 'critical' ? 'border-l-red-500' :
+                                      f.severity === 'high' ? 'border-l-orange-500' :
+                                      f.severity === 'medium' ? 'border-l-yellow-500' :
+                                      f.severity === 'low' ? 'border-l-blue-400' : 'border-l-border'
+                                    }`}>
+                                      <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs text-muted-foreground">{f.category}</span>
+                                        {getSecurityBadge(f.severity)}
+                                      </div>
+                                      <p className="text-sm font-medium">{f.title}</p>
+                                      <p className="text-xs text-muted-foreground mt-0.5">{f.description}</p>
+                                      {f.evidence && <p className="text-xs font-mono bg-muted px-2 py-1 rounded mt-1">Evidence: {f.evidence}</p>}
+                                      {f.recommendation && <p className="text-xs text-primary mt-1">Recommendation: {f.recommendation}</p>}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}

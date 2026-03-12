@@ -137,12 +137,63 @@ const SECRET_PATTERNS = [
   /xox[bporas]-[a-zA-Z0-9-]+/,
 ];
 
+// ─── MCP Server Security Standard (MSSS) v0.1 Reference ────────────────────
+// https://github.com/mcp-security-standard/mcp-server-security-standard
+
+const MSSS_CONTROLS = {
+  'MCP-INPUT-01': { id: 'MCP-INPUT-01', level: 'L1', title: 'JSON Schema Validation', description: 'All tool arguments must be validated against a strict JSON Schema before execution.' },
+  'MCP-INPUT-02': { id: 'MCP-INPUT-02', level: 'L2', title: 'Input Bounds Enforcement', description: 'Explicit bounds (maxLength, maxItems, maxProperties) must be defined on all input parameters.' },
+  'MCP-NET-01':   { id: 'MCP-NET-01',   level: 'L1', title: 'URL Validation / SSRF Prevention', description: 'URL parameters must be validated against an allowlist or block private IP ranges and metadata endpoints.' },
+  'MCP-FS-01':    { id: 'MCP-FS-01',    level: 'L1', title: 'Path Allowlisting', description: 'File/path parameters must be restricted to an allowlist to prevent unauthorized access.' },
+  'MCP-FS-02':    { id: 'MCP-FS-02',    level: 'L1', title: 'Symlink Resolution', description: 'Servers must resolve symlinks and verify the canonical path is within the allowlist.' },
+  'MCP-EXEC-01':  { id: 'MCP-EXEC-01',  level: 'L1', title: 'No Shell Execution', description: 'Tools must not use shell=true or equivalent; use direct process invocation instead.' },
+  'MCP-EXEC-03':  { id: 'MCP-EXEC-03',  level: 'L2', title: 'Argument Separation', description: 'Command arguments must be passed as arrays, never interpolated into shell strings.' },
+  'MCP-NET-03':   { id: 'MCP-NET-03',   level: 'L2', title: 'TLS 1.2+ Enforcement', description: 'All remote connections must use TLS 1.2 or higher.' },
+  'MCP-LOG-01':   { id: 'MCP-LOG-01',   level: 'L3', title: 'Audit Logging', description: 'All tool invocations must be logged with sufficient context for forensic investigation.' },
+  'MCP-LOG-02':   { id: 'MCP-LOG-02',   level: 'L1', title: 'Secret Redaction', description: 'Secrets and credentials must be automatically redacted from logs and responses.' },
+  'MCP-AUTHZ-01': { id: 'MCP-AUTHZ-01', level: 'L3', title: 'OAuth 2.1 Delegation', description: 'Tools requiring elevated access should use OAuth 2.1 delegation flows.' },
+  'MCP-AUTHZ-03': { id: 'MCP-AUTHZ-03', level: 'L3', title: 'Least Privilege', description: 'Each tool should request only the minimum permissions required for its function.' },
+};
+
+// ─── MSSS Detection Pattern Arrays ──────────────────────────────────────────
+
+// URL-like parameter names (SSRF / MCP-NET-01)
+const URL_PARAM_NAMES = [
+  'url', 'uri', 'endpoint', 'link', 'href', 'target', 'host',
+  'base_url', 'baseurl', 'webhook', 'webhook_url', 'callback',
+  'callback_url', 'redirect', 'redirect_url', 'fetch_url', 'source_url',
+];
+
+// Path-like parameter names (path traversal / MCP-FS-01)
+const PATH_PARAM_NAMES = [
+  'path', 'file', 'filepath', 'file_path', 'filename', 'file_name',
+  'directory', 'dir', 'folder', 'dest', 'destination', 'src', 'source',
+  'target_path', 'output_path', 'input_path', 'base_path', 'root_path',
+];
+
+// Symlink-related patterns in descriptions (MCP-FS-02)
+const SYMLINK_PATTERNS = [
+  /symlink/i, /symbolic\s+link/i, /readlink/i,
+  /ln\s+-s/i, /os\.readlink/i, /followlinks/i,
+];
+
+// Command argument parameter names (argument injection / MCP-EXEC-03)
+const ARG_INJECTION_PARAM_NAMES = [
+  'cmd', 'command', 'args', 'argv', 'shell', 'shell_cmd', 'shell_command',
+  'exec', 'execute', 'run', 'script', 'process', 'subprocess', 'invoke',
+  'cli_args', 'params', 'flags', 'options',
+];
+
 type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
 interface Finding {
   owaspId: string;
   owaspTitle: string;
   owaspUrl: string;
+  /** MSSS control ID (e.g. MCP-INPUT-01) when this finding maps to the MCP Server Security Standard */
+  msssId?: string;
+  /** MSSS compliance level (L1–L4) of the failing control */
+  msssLevel?: string;
   severity: Severity;
   category: string;
   title: string;
@@ -645,6 +696,253 @@ function analyzeCrossToolViolations(tools: MCPTool[]): Finding[] {
   return findings;
 }
 
+// ─── MSSS Analysis Functions ─────────────────────────────────────────────────
+
+/**
+ * MCP-INPUT-01 (L1): JSON Schema Validation
+ * Detects tools that lack a proper inputSchema or use loose schemas that permit
+ * arbitrary extra properties, enabling schema-poisoning and injection attacks.
+ */
+function analyzeToolInputSchemaValidation(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+
+  // No inputSchema at all → cannot validate anything
+  if (!tool.inputSchema || typeof tool.inputSchema !== 'object') {
+    findings.push({
+      owaspId: 'MCP05',
+      owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+      msssId: 'MCP-INPUT-01',
+      msssLevel: 'L1',
+      severity: 'high',
+      category: 'Schema Validation',
+      title: 'Tool missing inputSchema — no argument validation',
+      description: `The tool "${tool.name}" does not declare an inputSchema. Without a schema, tool arguments cannot be validated, enabling injection attacks and type confusion.`,
+      toolName: tool.name,
+    });
+    return findings;
+  }
+
+  const schema = tool.inputSchema;
+
+  // Schema exists but additionalProperties is not explicitly false
+  if (schema.additionalProperties !== false && schema.additionalProperties !== false) {
+    // Only flag if the tool actually defines properties (implies it expects structured input)
+    if (schema.properties && Object.keys(schema.properties).length > 0) {
+      findings.push({
+        owaspId: 'MCP05',
+        owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+        msssId: 'MCP-INPUT-01',
+        msssLevel: 'L1',
+        severity: 'medium',
+        category: 'Schema Validation',
+        title: 'Tool schema allows additional properties',
+        description: `The tool "${tool.name}" schema does not set additionalProperties: false, allowing unexpected extra fields to be passed to the tool, which may bypass validation.`,
+        toolName: tool.name,
+        evidence: 'additionalProperties not set to false',
+      });
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * MCP-INPUT-02 (L2): Input Bounds Enforcement
+ * Detects tool schemas that lack explicit bounds (maxLength, maxItems, maximum, etc.)
+ * on their parameters, enabling DoS via memory exhaustion or ReDoS.
+ */
+function analyzeToolInputBounds(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const schema = tool.inputSchema;
+  if (!schema?.properties || typeof schema.properties !== 'object') return findings;
+
+  const unboundedStrings: string[] = [];
+  const unboundedArrays: string[] = [];
+
+  for (const [name, prop] of Object.entries(schema.properties as Record<string, Record<string, unknown>>)) {
+    if (prop.type === 'string' && prop.maxLength === undefined && prop.enum === undefined) {
+      unboundedStrings.push(name);
+    }
+    if (prop.type === 'array' && prop.maxItems === undefined) {
+      unboundedArrays.push(name);
+    }
+  }
+
+  if (unboundedStrings.length > 0) {
+    findings.push({
+      owaspId: 'MCP05',
+      owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+      msssId: 'MCP-INPUT-02',
+      msssLevel: 'L2',
+      severity: 'medium',
+      category: 'Input Bounds',
+      title: 'String parameters lack maxLength constraints',
+      description: `The tool "${tool.name}" has string parameters without maxLength limits: ${unboundedStrings.join(', ')}. Unbounded strings can cause memory exhaustion or ReDoS attacks.`,
+      toolName: tool.name,
+      evidence: unboundedStrings.join(', '),
+    });
+  }
+
+  if (unboundedArrays.length > 0) {
+    findings.push({
+      owaspId: 'MCP05',
+      owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+      msssId: 'MCP-INPUT-02',
+      msssLevel: 'L2',
+      severity: 'low',
+      category: 'Input Bounds',
+      title: 'Array parameters lack maxItems constraints',
+      description: `The tool "${tool.name}" has array parameters without maxItems limits: ${unboundedArrays.join(', ')}. Unbounded arrays can cause memory exhaustion attacks.`,
+      toolName: tool.name,
+      evidence: unboundedArrays.join(', '),
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * MCP-NET-01 (L1): URL Validation / SSRF Prevention
+ * Detects tools with URL-type parameters that lack a pattern or format constraint.
+ * Without allowlist validation, these tools are potential SSRF vectors.
+ */
+function analyzeToolForSSRF(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const schema = tool.inputSchema;
+  if (!schema?.properties || typeof schema.properties !== 'object') return findings;
+
+  const ssrfParams: string[] = [];
+  for (const [name, prop] of Object.entries(schema.properties as Record<string, Record<string, unknown>>)) {
+    const lowerName = name.toLowerCase();
+    const isUrlParam = URL_PARAM_NAMES.some(u => lowerName === u || lowerName.endsWith(`_${u}`) || lowerName.endsWith(u));
+    if (isUrlParam && prop.type === 'string' && prop.pattern === undefined && prop.format === undefined && prop.enum === undefined) {
+      ssrfParams.push(name);
+    }
+  }
+
+  if (ssrfParams.length > 0) {
+    findings.push({
+      owaspId: 'MCP07',
+      owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+      msssId: 'MCP-NET-01',
+      msssLevel: 'L1',
+      severity: 'high',
+      category: 'SSRF',
+      title: 'URL parameter without validation — potential SSRF vector',
+      description: `The tool "${tool.name}" accepts URL-like parameter(s) without pattern or format constraints: ${ssrfParams.join(', ')}. An attacker could use these to probe internal services, cloud metadata (169.254.169.254), or private networks.`,
+      toolName: tool.name,
+      evidence: ssrfParams.join(', '),
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * MCP-FS-01 (L1) + MCP-FS-02 (L1): Path Allowlisting & Symlink Resolution
+ * Detects tools with file/path parameters lacking pattern restrictions (path traversal risk)
+ * and tools whose descriptions reference symbolic links (symlink resolution risk).
+ */
+function analyzeToolForPathTraversal(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+
+  // MCP-FS-01: path-like params without pattern constraint
+  const schema = tool.inputSchema;
+  if (schema?.properties && typeof schema.properties === 'object') {
+    const unsafePaths: string[] = [];
+    for (const [name, prop] of Object.entries(schema.properties as Record<string, Record<string, unknown>>)) {
+      const lowerName = name.toLowerCase();
+      const isPathParam = PATH_PARAM_NAMES.some(p => lowerName === p || lowerName.endsWith(`_${p}`) || lowerName.startsWith(`${p}_`));
+      if (isPathParam && prop.type === 'string' && prop.pattern === undefined && prop.enum === undefined) {
+        unsafePaths.push(name);
+      }
+    }
+
+    if (unsafePaths.length > 0) {
+      findings.push({
+        owaspId: 'MCP05',
+        owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+        msssId: 'MCP-FS-01',
+        msssLevel: 'L1',
+        severity: 'high',
+        category: 'Path Traversal',
+        title: 'Path parameter without allowlist constraint — path traversal risk',
+        description: `The tool "${tool.name}" accepts path/file parameter(s) without a pattern constraint: ${unsafePaths.join(', ')}. An attacker could pass "../../../etc/passwd" or absolute paths to access arbitrary files.`,
+        toolName: tool.name,
+        evidence: unsafePaths.join(', '),
+      });
+    }
+  }
+
+  // MCP-FS-02: symlink patterns in description
+  const desc = tool.description || '';
+  for (const pattern of SYMLINK_PATTERNS) {
+    const match = desc.match(pattern);
+    if (match) {
+      findings.push({
+        owaspId: 'MCP05',
+        owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+        msssId: 'MCP-FS-02',
+        msssLevel: 'L1',
+        severity: 'medium',
+        category: 'Symlink Traversal',
+        title: 'Tool description references symlinks — verify canonical path resolution',
+        description: `The tool "${tool.name}" mentions symlinks or symbolic links. If symlinks are followed without resolving and validating the canonical path, an attacker can escape the intended file access boundary.`,
+        toolName: tool.name,
+        evidence: match[0],
+      });
+      break;
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * MCP-EXEC-03 (L2): Argument Separation
+ * Detects tools with command/argument parameters that accept raw strings without
+ * enum constraints, indicating arguments may be interpolated into shell strings.
+ */
+function analyzeToolForArgumentInjection(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const schema = tool.inputSchema;
+  if (!schema?.properties || typeof schema.properties !== 'object') return findings;
+
+  const dangerousParams: string[] = [];
+  for (const [name, prop] of Object.entries(schema.properties as Record<string, Record<string, unknown>>)) {
+    const lowerName = name.toLowerCase();
+    const isArgParam = ARG_INJECTION_PARAM_NAMES.some(a => lowerName === a || lowerName.endsWith(`_${a}`) || lowerName.startsWith(`${a}_`));
+    if (isArgParam && prop.type === 'string' && prop.enum === undefined) {
+      dangerousParams.push(name);
+    }
+  }
+
+  if (dangerousParams.length > 0) {
+    findings.push({
+      owaspId: 'MCP05',
+      owaspTitle: OWASP_MCP_TOP_10.MCP05.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP05.url,
+      msssId: 'MCP-EXEC-03',
+      msssLevel: 'L2',
+      severity: 'high',
+      category: 'Argument Injection',
+      title: 'Command/argument parameter without enum allowlist — argument injection risk',
+      description: `The tool "${tool.name}" accepts unconstrained command or argument parameter(s): ${dangerousParams.join(', ')}. If these are interpolated into a shell command string, an attacker can inject arbitrary commands. Arguments should be passed as arrays with an explicit allowlist (enum).`,
+      toolName: tool.name,
+      evidence: dangerousParams.join(', '),
+    });
+  }
+
+  return findings;
+}
+
 // ─── Main Handler ────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -778,12 +1076,19 @@ export async function POST(request: NextRequest) {
 
     // Per-tool checks
     for (const tool of tools) {
+      // Existing OWASP-based checks
       findings.push(...analyzeToolForHiddenInstructions(tool));
       findings.push(...analyzeToolForSensitiveFileAccess(tool));
       findings.push(...analyzeToolForShadowing(tool));
       findings.push(...analyzeToolForExfiltration(tool));
       findings.push(...analyzeToolForCommandInjection(tool));
       findings.push(...analyzeToolForSecretLeakage(tool));
+      // MSSS-aligned checks
+      findings.push(...analyzeToolInputSchemaValidation(tool));  // MCP-INPUT-01
+      findings.push(...analyzeToolInputBounds(tool));            // MCP-INPUT-02
+      findings.push(...analyzeToolForSSRF(tool));                // MCP-NET-01
+      findings.push(...analyzeToolForPathTraversal(tool));       // MCP-FS-01 + MCP-FS-02
+      findings.push(...analyzeToolForArgumentInjection(tool));   // MCP-EXEC-03
     }
 
     // Cross-tool checks
@@ -808,6 +1113,15 @@ export async function POST(request: NextRequest) {
       checked: true,
     }));
 
+    // MSSS coverage: which controls produced findings (remotely detectable subset)
+    const msssControls = Object.values(MSSS_CONTROLS).map(ctrl => ({
+      id: ctrl.id,
+      level: ctrl.level,
+      title: ctrl.title,
+      findingsCount: findings.filter(f => f.msssId === ctrl.id).length,
+      checked: true,
+    }));
+
     return NextResponse.json({
       timestamp: new Date().toISOString(),
       serverUrl,
@@ -816,6 +1130,7 @@ export async function POST(request: NextRequest) {
       findings,
       summary,
       owaspCoverage,
+      msssControls,
       raw: { init: rawInit, tools: rawTools },
     });
   } catch (error) {

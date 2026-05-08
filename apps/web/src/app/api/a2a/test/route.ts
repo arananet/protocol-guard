@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { assertPublicUrl, sanitizeAuthHeader, sanitizeCustomHeaders, sanitizeHeaderValue } from '@/lib/ssrf-guard';
 
 // A2A spec URLs and versions
 const A2A_SPEC = {
@@ -109,24 +110,30 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Agent Card URL required' }, { status: 400 });
     }
 
+    try {
+      assertPublicUrl(agentCardUrl);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Invalid URL' },
+        { status: 400 },
+      );
+    }
+
     // Build headers for authenticated requests
     const headers: Record<string, string> = {};
+    const safeAuthHeader = sanitizeAuthHeader(authHeader);
     if (authType && authType !== 'none' && authValue) {
+      const safeValue = sanitizeHeaderValue(String(authValue));
       if (authType === 'api_key') {
-        headers[authHeader || 'Authorization'] = authValue;
+        headers[safeAuthHeader] = safeValue;
       } else if (authType === 'bearer') {
-        headers[authHeader || 'Authorization'] = `Bearer ${authValue}`;
+        headers[safeAuthHeader] = `Bearer ${safeValue}`;
       } else if (authType === 'basic') {
-        headers[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+        headers[safeAuthHeader] = `Basic ${Buffer.from(safeValue).toString('base64')}`;
       }
     }
 
-    // Apply custom headers
-    if (Array.isArray(customHeaders)) {
-      for (const h of customHeaders) {
-        if (h.key && h.value) headers[h.key] = h.value;
-      }
-    }
+    Object.assign(headers, sanitizeCustomHeaders(customHeaders));
 
     // Fetch agent card (tries multiple well-known paths)
     const { card: agentCard, resolvedUrl, error: fetchError } = await fetchAgentCard(agentCardUrl, headers);

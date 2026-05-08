@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { assertPublicUrl, sanitizeAuthHeader, sanitizeCustomHeaders, sanitizeHeaderValue } from '@/lib/ssrf-guard';
 
 /**
  * MCP Security Scanner — OWASP MCP Top 10 vulnerability analysis
@@ -953,27 +954,33 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Server URL required' }, { status: 400 });
     }
 
+    try {
+      assertPublicUrl(serverUrl);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Invalid URL' },
+        { status: 400 },
+      );
+    }
+
     const reqHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
     };
 
+    const safeAuthHeader = sanitizeAuthHeader(authHeader);
     if (authType && authType !== 'none' && authValue) {
+      const safeValue = sanitizeHeaderValue(String(authValue));
       if (authType === 'api_key') {
-        reqHeaders[authHeader || 'Authorization'] = authValue;
+        reqHeaders[safeAuthHeader] = safeValue;
       } else if (authType === 'bearer') {
-        reqHeaders[authHeader || 'Authorization'] = `Bearer ${authValue}`;
+        reqHeaders[safeAuthHeader] = `Bearer ${safeValue}`;
       } else if (authType === 'basic') {
-        reqHeaders[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+        reqHeaders[safeAuthHeader] = `Basic ${Buffer.from(safeValue).toString('base64')}`;
       }
     }
 
-    // Apply custom headers
-    if (Array.isArray(customHeaders)) {
-      for (const h of customHeaders) {
-        if (h.key && h.value) reqHeaders[h.key] = h.value;
-      }
-    }
+    Object.assign(reqHeaders, sanitizeCustomHeaders(customHeaders));
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let initResult: any = null;
@@ -1131,7 +1138,6 @@ export async function POST(request: NextRequest) {
       summary,
       owaspCoverage,
       msssControls,
-      raw: { init: rawInit, tools: rawTools },
     });
   } catch (error) {
     return NextResponse.json(

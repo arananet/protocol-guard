@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { assertPublicUrl, sanitizeAuthHeader, sanitizeCustomHeaders, sanitizeHeaderValue } from '@/lib/ssrf-guard';
 
 // UCP spec reference
 const UCP_SPEC = {
@@ -359,6 +360,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Endpoint URL required' }, { status: 400 });
     }
 
+    try {
+      assertPublicUrl(endpoint);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Invalid URL' },
+        { status: 400 },
+      );
+    }
+
     // Normalise base URL (strip trailing slash)
     const baseUrl = endpoint.replace(/\/+$/, '');
     const profileUrl = `${baseUrl}/.well-known/ucp`;
@@ -368,20 +378,19 @@ export async function POST(request: NextRequest) {
       'Accept': 'application/json',
     };
 
+    const safeAuthHeader = sanitizeAuthHeader(authHeader);
     if (authType === 'bearer' && authValue) {
-      headers[authHeader || 'Authorization'] = `Bearer ${authValue}`;
+      headers[safeAuthHeader] = `Bearer ${sanitizeHeaderValue(String(authValue))}`;
     } else if (authType === 'basic' && authValue) {
-      headers[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+      headers[safeAuthHeader] = `Basic ${Buffer.from(sanitizeHeaderValue(String(authValue))).toString('base64')}`;
     } else if (authType === 'api_key' && authValue) {
-      headers[authHeader || 'X-API-Key'] = authValue;
+      const keyHeader = sanitizeAuthHeader(authHeader) === 'Authorization' && !authHeader
+        ? 'X-API-Key'
+        : safeAuthHeader;
+      headers[keyHeader] = sanitizeHeaderValue(String(authValue));
     }
 
-    // Apply custom headers
-    if (Array.isArray(customHeaders)) {
-      for (const h of customHeaders) {
-        if (h.key && h.value) headers[h.key] = h.value;
-      }
-    }
+    Object.assign(headers, sanitizeCustomHeaders(customHeaders));
 
     // ── Fetch the UCP Business Profile from /.well-known/ucp ─────────
     let profileData: Record<string, unknown>;

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { assertPublicUrl, sanitizeAuthHeader, sanitizeCustomHeaders, sanitizeHeaderValue } from '@/lib/ssrf-guard';
 
 /**
  * A2A Security Scanner — Agent Card & Endpoint vulnerability analysis
@@ -361,6 +362,8 @@ function analyzeCapabilities(card: AgentCard): Finding[] {
 // ─── Agent Card Fetching ─────────────────────────────────────────────────────
 
 async function fetchAgentCard(url: string, headers: Record<string, string> = {}): Promise<{ card: AgentCard; resolvedUrl: string }> {
+  assertPublicUrl(url);
+
   const attempts = [
     url,
     url.replace(/\/$/, '') + '/.well-known/agent.json',
@@ -393,6 +396,7 @@ async function analyzeSecurityHeaders(url: string, extraHeaders: Record<string, 
   const findings: Finding[] = [];
 
   try {
+    assertPublicUrl(url);
     const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json', ...extraHeaders } });
     const headers = res.headers;
 
@@ -453,6 +457,12 @@ async function probeEndpoint(card: AgentCard, extraHeaders: Record<string, strin
   if (!agentUrl) return findings;
 
   try {
+    assertPublicUrl(agentUrl);
+  } catch {
+    return findings;
+  }
+
+  try {
     // Try sending a minimal tasks/send to see if the agent validates properly
     const res = await fetch(agentUrl, {
       method: 'POST',
@@ -511,24 +521,30 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Agent URL required' }, { status: 400 });
     }
 
+    try {
+      assertPublicUrl(agentUrl);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Invalid URL' },
+        { status: 400 },
+      );
+    }
+
     // Build auth headers
     const reqHeaders: Record<string, string> = {};
+    const safeAuthHeader = sanitizeAuthHeader(authHeader);
     if (authType && authType !== 'none' && authValue) {
+      const safeValue = sanitizeHeaderValue(String(authValue));
       if (authType === 'api_key') {
-        reqHeaders[authHeader || 'Authorization'] = authValue;
+        reqHeaders[safeAuthHeader] = safeValue;
       } else if (authType === 'bearer') {
-        reqHeaders[authHeader || 'Authorization'] = `Bearer ${authValue}`;
+        reqHeaders[safeAuthHeader] = `Bearer ${safeValue}`;
       } else if (authType === 'basic') {
-        reqHeaders[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
+        reqHeaders[safeAuthHeader] = `Basic ${Buffer.from(safeValue).toString('base64')}`;
       }
     }
 
-    // Apply custom headers
-    if (Array.isArray(customHeaders)) {
-      for (const h of customHeaders) {
-        if (h.key && h.value) reqHeaders[h.key] = h.value;
-      }
-    }
+    Object.assign(reqHeaders, sanitizeCustomHeaders(customHeaders));
 
     // Fetch agent card
     let card: AgentCard;
@@ -590,7 +606,6 @@ export async function POST(request: NextRequest) {
       findings,
       summary,
       categories,
-      raw: { agentCard: card },
     });
   } catch (error) {
     return NextResponse.json(

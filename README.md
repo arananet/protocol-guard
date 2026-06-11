@@ -15,8 +15,8 @@ See [LICENSE](LICENSE) for the full license text.
 ## Features
 
 ### Compliance Testing
-- **MCP Compliance** — validate MCP server implementations against the official specification (protocol version, capabilities, required methods)
-- **A2A Compliance** — verify A2A agent cards (required fields, skills, input/output modes, capabilities, authentication schemes)
+- **MCP Compliance** — validate MCP server implementations against the official specification. The scanner negotiates the latest revision (`2025-06-18`) and flags servers that downgrade to **deprecated revisions** (`2024-11-05`, `2025-03-26`) that predate the OAuth Resource Server model and Resource Indicators (RFC 8707). Checks protocol version, capabilities, required methods, and echoes the `MCP-Protocol-Version` header on subsequent requests.
+- **A2A Compliance** — verify A2A agent cards against the current spec (`0.3.0`). Resolves the canonical `/.well-known/agent-card.json` (with legacy `/.well-known/agent.json` fallback) and validates required fields, `protocolVersion`, skills, input/output modes, capabilities, **transport declarations** (`preferredTransport`/`additionalInterfaces`: JSONRPC, GRPC, HTTP+JSON), modern **`securitySchemes`/`security`** (with legacy `authentication` fallback), and **JWS card signatures** (`AgentCardSignature`).
 - **UCP Compliance** — 18 compliance rules validating UCP business profiles against the [published specification](https://ucp.dev/latest/specification/overview) (profile structure, services, capabilities, transport bindings, signing keys, vendor namespaces)
 
 ### Interactive Testing
@@ -38,7 +38,19 @@ See [LICENSE](LICENSE) for the full license text.
 
   Each finding that maps to a MSSS control includes `msssId` and `msssLevel` fields. The scan response also includes a `msssControls` coverage block alongside the existing `owaspCoverage` block.
 
-- **A2A Security Scanner** — 8-category analysis covering spec compliance, authentication, transport security, injection risks, secret leakage, and security headers. Scan approach inspired by [a2a-scanner](https://github.com/cisco-ai-defense/a2a-scanner).
+- **MCP Spec & Authorization Hardening** — on top of OWASP/MSSS, the scanner audits the security-relevant additions of the recent MCP revisions:
+
+  | Check | What is evaluated |
+  |-------|-------------------|
+  | Protocol version | Negotiated revision is current; deprecated revisions (no Resource Indicators / OAuth Resource Server model) are flagged |
+  | OAuth 2.1 metadata | Probes `/.well-known/oauth-protected-resource` (RFC 9728) and inspects the `WWW-Authenticate` challenge for a `resource_metadata` pointer; flags openly-accessible servers |
+  | Tool annotations | State-changing tools missing `ToolAnnotations`, and misleading `readOnlyHint` on mutating tools (2025-06-18+) |
+  | Resources & prompts | `resources/list` and `prompts/list` are scanned for `file://` exposure, sensitive locations, and hidden-instruction / intent-subversion poisoning |
+  | Lethal trifecta | Servers that co-locate untrusted-input ingestion, private-data access, and outbound communication (prompt-injection exfiltration risk) |
+
+- **MCP Apps (interactive UI) Scanner** — detects the [MCP Apps extension](https://github.com/modelcontextprotocol/ext-apps) (SEP-1865): `ui://` resources, `text/html` resources, and tools linked to UI templates via `_meta`. Flags the host-side obligations (sandboxed iframe rendering, CSP from resource metadata, auditable `postMessage` JSON-RPC, explicit consent for UI-initiated tool calls), external-origin UI assets, and hidden instructions embedded in UI markup.
+
+- **A2A Security Scanner** — multi-category analysis covering spec compliance, **modern `securitySchemes`/`security`** (apiKey-in-query and HTTP Basic weaknesses, declared-but-unreferenced schemes), **JWS agent-card signatures** (presence, `alg: none`, missing `kid`), **transport bindings** (HTTP-over-plaintext interface endpoints, unknown transports), **declared extensions** including the **A2A UI / A2UI** extension (untrusted server-driven UI rendering), auxiliary URLs (`iconUrl`/`documentationUrl`), legacy well-known-path detection, injection risks, secret leakage, and security headers. Scan approach inspired by [a2a-scanner](https://github.com/cisco-ai-defense/a2a-scanner).
 
 ### Privacy
 - Zero data storage — nothing is ever persisted

@@ -107,19 +107,62 @@ export const A2A_COMPLIANCE_RULES: ComplianceRule[] = [
     },
   },
   {
+    id: 'agent-card-protocol-version',
+    name: 'Protocol Version',
+    description: 'Agent card should declare the A2A protocolVersion',
+    severity: 'warning',
+    check: (agentCard) => ({
+      passed: !!agentCard.protocolVersion,
+      ruleId: 'agent-card-protocol-version',
+      message: agentCard.protocolVersion
+        ? `Protocol version: ${agentCard.protocolVersion}`
+        : 'No protocolVersion declared (current A2A spec expects one)',
+      severity: 'warning' as const,
+    }),
+  },
+  {
     id: 'agent-card-authentication',
-    name: 'Authentication',
-    description: 'Agent card must declare supported authentication schemes',
+    name: 'Security Schemes',
+    description: 'Agent card must declare security schemes (securitySchemes/security) or legacy authentication',
     severity: 'critical',
     check: (agentCard) => {
-      const hasAuth = agentCard.authentication?.schemes?.length > 0;
+      const hasModern =
+        (!!agentCard.securitySchemes && Object.keys(agentCard.securitySchemes).length > 0) ||
+        (Array.isArray(agentCard.security) && agentCard.security.length > 0);
+      const hasLegacy = !!agentCard.authentication?.schemes?.length;
+      const hasAuth = hasModern || hasLegacy;
+      let message: string;
+      if (hasModern && agentCard.securitySchemes) {
+        message = `Security schemes: ${Object.keys(agentCard.securitySchemes).join(', ')}`;
+      } else if (hasModern) {
+        message = 'Security requirement declared';
+      } else if (hasLegacy) {
+        message = `Legacy authentication schemes: ${agentCard.authentication!.schemes.join(', ')} (migrate to securitySchemes)`;
+      } else {
+        message = 'No security schemes declared';
+      }
       return {
         passed: hasAuth,
         ruleId: 'agent-card-authentication',
-        message: hasAuth
-          ? `Authentication schemes: ${agentCard.authentication.schemes.join(', ')}`
-          : 'No authentication schemes declared',
+        message,
         severity: 'critical' as const,
+      };
+    },
+  },
+  {
+    id: 'agent-card-signature',
+    name: 'Card Signature',
+    description: 'Agent card should be JWS-signed for integrity (AgentCardSignature)',
+    severity: 'info',
+    check: (agentCard) => {
+      const signed = Array.isArray(agentCard.signatures) && agentCard.signatures.length > 0;
+      return {
+        passed: true,
+        ruleId: 'agent-card-signature',
+        message: signed
+          ? `Agent card is JWS-signed (${agentCard.signatures!.length} signature(s))`
+          : 'Agent card is not signed — clients cannot verify integrity',
+        severity: 'info' as const,
       };
     },
   },

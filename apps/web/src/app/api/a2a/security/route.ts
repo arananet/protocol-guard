@@ -23,16 +23,56 @@ interface Finding {
   recommendation?: string;
 }
 
+interface AgentInterface {
+  url?: string;
+  // Newer drafts use `protocolBinding`; v0.2.x/v0.3.x use `transport`
+  transport?: string;
+  protocolBinding?: string;
+  protocolVersion?: string;
+}
+
+interface AgentExtension {
+  uri?: string;
+  description?: string;
+  required?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params?: Record<string, any>;
+}
+
+interface AgentCardSignature {
+  protected?: string;
+  signature?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  header?: Record<string, any>;
+}
+
 interface AgentCard {
   name?: string;
   description?: string;
   url?: string;
   version?: string;
+  protocolVersion?: string;
+  iconUrl?: string;
+  documentationUrl?: string;
+  // Transport selection (A2A v0.2.x+)
+  preferredTransport?: string;
+  additionalInterfaces?: AgentInterface[];
+  supportedInterfaces?: AgentInterface[];
   capabilities?: {
     streaming?: boolean;
     pushNotifications?: boolean;
     stateTransitionHistory?: boolean;
+    extensions?: AgentExtension[];
+    extendedAgentCard?: boolean;
   };
+  supportsAuthenticatedExtendedCard?: boolean;
+  // Modern OpenAPI-style security (A2A current spec)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  securitySchemes?: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  security?: Array<Record<string, any>>;
+  signatures?: AgentCardSignature[];
+  // Legacy (deprecated) authentication block
   authentication?: {
     schemes?: string[];
     credentials?: string;
@@ -45,6 +85,10 @@ interface AgentCard {
     description?: string;
     tags?: string[];
     examples?: string[];
+    inputModes?: string[];
+    outputModes?: string[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    security?: Array<Record<string, any>>;
   }>;
   provider?: {
     organization?: string;
@@ -53,6 +97,8 @@ interface AgentCard {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [key: string]: any;
 }
+
+const A2A_KNOWN_TRANSPORTS = ['JSONRPC', 'GRPC', 'HTTP+JSON'];
 
 // ─── Detection Patterns (YARA-inspired) ──────────────────────────────────────
 
@@ -120,6 +166,16 @@ function analyzeSpecCompliance(card: AgentCard, resolvedUrl: string): Finding[] 
     });
   }
 
+  if (!card.protocolVersion) {
+    findings.push({
+      category: 'Spec Compliance',
+      severity: 'low',
+      title: 'Missing protocolVersion field',
+      description: 'The agent card does not declare a "protocolVersion". Current A2A spec revisions require agents to advertise the A2A protocol version they implement so clients can negotiate compatibility.',
+      recommendation: 'Add a "protocolVersion" field (e.g., "0.3.0").',
+    });
+  }
+
   if (!card.skills || card.skills.length === 0) {
     findings.push({
       category: 'Spec Compliance',
@@ -166,16 +222,46 @@ function analyzeSpecCompliance(card: AgentCard, resolvedUrl: string): Finding[] 
 function analyzeAuthentication(card: AgentCard, resolvedUrl: string): Finding[] {
   const findings: Finding[] = [];
 
-  if (!card.authentication || !card.authentication.schemes || card.authentication.schemes.length === 0) {
+  const hasModernSecurity =
+    (card.securitySchemes && Object.keys(card.securitySchemes).length > 0) ||
+    (Array.isArray(card.security) && card.security.length > 0);
+  const hasLegacyAuth = !!card.authentication?.schemes?.length;
+
+  if (!hasModernSecurity && !hasLegacyAuth) {
     findings.push({
       category: 'Authentication',
       severity: 'high',
       title: 'No authentication scheme declared',
-      description: 'The agent card does not specify any authentication mechanism. The agent endpoint may be publicly accessible without authentication.',
-      recommendation: 'Implement authentication (e.g., OAuth2, API key, bearer token) and declare it in the agent card.',
+      description: 'The agent card declares neither "securitySchemes"/"security" (current A2A spec) nor a legacy "authentication" block. The agent endpoint may be publicly accessible without authentication.',
+      recommendation: 'Declare OpenAPI-style "securitySchemes" (apiKey, http bearer, oauth2, openIdConnect) and reference them in "security".',
     });
   }
 
+  // Using the deprecated authentication block instead of securitySchemes.
+  if (hasLegacyAuth && !hasModernSecurity) {
+    findings.push({
+      category: 'Spec Compliance',
+      severity: 'low',
+      title: 'Uses deprecated "authentication" block',
+      description: 'The agent card uses the legacy "authentication.schemes" field. Current A2A revisions replace this with OpenAPI-style "securitySchemes" plus a "security" requirements array.',
+      evidence: (card.authentication?.schemes || []).join(', '),
+      recommendation: 'Migrate to "securitySchemes" and "security".',
+    });
+  }
+
+  // securitySchemes declared but never referenced by a security requirement.
+  if (card.securitySchemes && Object.keys(card.securitySchemes).length > 0 &&
+      (!Array.isArray(card.security) || card.security.length === 0)) {
+    findings.push({
+      category: 'Authentication',
+      severity: 'medium',
+      title: 'securitySchemes declared but no "security" requirement set',
+      description: 'The agent defines securitySchemes but does not list any of them in a top-level "security" requirement. Clients cannot tell which scheme(s) are actually required, and the endpoint may accept unauthenticated calls.',
+      recommendation: 'Add a "security" array referencing the required scheme(s).',
+    });
+  }
+
+  // Inline credentials must never appear in a public card.
   if (card.authentication?.credentials) {
     findings.push({
       category: 'Authentication',
@@ -185,6 +271,230 @@ function analyzeAuthentication(card: AgentCard, resolvedUrl: string): Finding[] 
       evidence: '[REDACTED]',
       recommendation: 'Remove credentials from the agent card immediately.',
     });
+  }
+
+  // Inspect securityScheme definitions for weak transport (e.g., apiKey in query string).
+  if (card.securitySchemes) {
+    for (const [name, scheme] of Object.entries(card.securitySchemes)) {
+      if (scheme && typeof scheme === 'object') {
+        const s = scheme as { type?: string; in?: string; scheme?: string };
+        if (s.type === 'apiKey' && s.in === 'query') {
+          findings.push({
+            category: 'Authentication',
+            severity: 'medium',
+            title: `API key passed in query string (scheme "${name}")`,
+            description: 'An apiKey security scheme is configured to carry the key in the URL query string. Query strings leak into logs, proxies, and browser history.',
+            evidence: `${name}: apiKey in query`,
+            recommendation: 'Carry API keys in a header, not a query parameter.',
+          });
+        }
+        if (s.type === 'http' && s.scheme === 'basic') {
+          findings.push({
+            category: 'Authentication',
+            severity: 'low',
+            title: `HTTP Basic auth declared (scheme "${name}")`,
+            description: 'HTTP Basic transmits reusable base64-encoded credentials on every request. Prefer bearer tokens or OAuth 2.0.',
+            evidence: `${name}: http basic`,
+            recommendation: 'Use OAuth 2.0 / OpenID Connect or short-lived bearer tokens.',
+          });
+        }
+      }
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * A2A Agent Cards MAY be signed with JWS (AgentCardSignature). Clients SHOULD
+ * verify signatures when present. An unsigned card cannot be proven authentic,
+ * so a man-in-the-middle could tamper with skills, URLs, or security schemes.
+ */
+function analyzeCardSignature(card: AgentCard): Finding[] {
+  const findings: Finding[] = [];
+
+  if (!Array.isArray(card.signatures) || card.signatures.length === 0) {
+    findings.push({
+      category: 'Integrity',
+      severity: 'medium',
+      title: 'Agent card is not signed (no JWS signatures)',
+      description: 'The agent card carries no "signatures" array. A2A supports JWS-signed agent cards (AgentCardSignature) so clients can verify the card has not been tampered with in transit or at a registry. Without a signature, skills, endpoint URLs, and security schemes can be silently altered.',
+      recommendation: 'Sign the agent card with JWS (RFC 7515) using a canonical JSON representation (RFC 8785) and publish the verification key.',
+    });
+    return findings;
+  }
+
+  // Validate each signature has the required JWS structure.
+  card.signatures.forEach((sig, i) => {
+    if (!sig || !sig.protected || !sig.signature) {
+      findings.push({
+        category: 'Integrity',
+        severity: 'medium',
+        title: `Malformed agent card signature [${i}]`,
+        description: 'A signature entry is missing the required "protected" header or "signature" value, so it cannot be verified as a valid JWS.',
+        recommendation: 'Ensure each signature includes base64url-encoded "protected" and "signature" fields.',
+      });
+      return;
+    }
+    // The protected header should declare alg + kid for key discovery.
+    try {
+      const headerJson = JSON.parse(Buffer.from(sig.protected, 'base64url').toString('utf-8'));
+      if (!headerJson.alg || headerJson.alg === 'none') {
+        findings.push({
+          category: 'Integrity',
+          severity: 'high',
+          title: `Agent card signature uses no/insecure algorithm [${i}]`,
+          description: 'The JWS protected header declares "alg": "none" or omits "alg". An unsecured signature provides no integrity protection.',
+          evidence: `alg: ${headerJson.alg || 'missing'}`,
+          recommendation: 'Use a strong asymmetric algorithm (e.g., RS256, ES256, EdDSA).',
+        });
+      }
+      if (!headerJson.kid) {
+        findings.push({
+          category: 'Integrity',
+          severity: 'low',
+          title: `Agent card signature missing key id (kid) [${i}]`,
+          description: 'The JWS protected header omits "kid", making it harder for clients to locate the correct verification key.',
+          recommendation: 'Include a "kid" referencing the published JWKS key.',
+        });
+      }
+    } catch {
+      findings.push({
+        category: 'Integrity',
+        severity: 'low',
+        title: `Agent card signature has an unparseable protected header [${i}]`,
+        description: 'The "protected" header is not valid base64url-encoded JSON.',
+        recommendation: 'Encode the protected header as base64url JSON per RFC 7515.',
+      });
+    }
+  });
+
+  return findings;
+}
+
+/**
+ * Validates declared transports (preferredTransport, additionalInterfaces /
+ * supportedInterfaces). A2A recognizes JSONRPC, GRPC and HTTP+JSON; every
+ * declared interface endpoint should be served over HTTPS.
+ */
+function analyzeTransports(card: AgentCard): Finding[] {
+  const findings: Finding[] = [];
+
+  const interfaces: AgentInterface[] = [
+    ...(Array.isArray(card.additionalInterfaces) ? card.additionalInterfaces : []),
+    ...(Array.isArray(card.supportedInterfaces) ? card.supportedInterfaces : []),
+  ];
+
+  const allTransports = [
+    card.preferredTransport,
+    ...interfaces.map(i => i.transport || i.protocolBinding),
+  ].filter((t): t is string => !!t);
+
+  for (const t of allTransports) {
+    if (!A2A_KNOWN_TRANSPORTS.includes(t)) {
+      findings.push({
+        category: 'Transport Security',
+        severity: 'low',
+        title: `Unrecognized transport declared: "${t}"`,
+        description: `The agent declares a transport "${t}" that is not one of the A2A-defined bindings (${A2A_KNOWN_TRANSPORTS.join(', ')}). Non-standard transports may not be interoperable or independently security-reviewed.`,
+        evidence: t,
+        recommendation: 'Use a standard A2A transport binding.',
+      });
+    }
+  }
+
+  for (const iface of interfaces) {
+    if (iface.url && iface.url.startsWith('http://') &&
+        !iface.url.includes('localhost') && !iface.url.includes('127.0.0.1')) {
+      findings.push({
+        category: 'Transport Security',
+        severity: 'high',
+        title: 'Declared interface endpoint uses plaintext HTTP',
+        description: `An additional interface (${iface.transport || iface.protocolBinding || 'unknown transport'}) is served over unencrypted HTTP, exposing it to interception and tampering.`,
+        evidence: iface.url,
+        recommendation: 'Serve all interface endpoints over HTTPS/TLS.',
+      });
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Inspects declared protocol extensions (capabilities.extensions), including
+ * interactive-UI extensions (A2UI). Server-driven UI rendered from agent
+ * responses must be sanitized to prevent injection in the rendering client.
+ */
+function analyzeExtensions(card: AgentCard): Finding[] {
+  const findings: Finding[] = [];
+  const extensions = card.capabilities?.extensions;
+  if (!Array.isArray(extensions) || extensions.length === 0) return findings;
+
+  for (const ext of extensions) {
+    const uri = ext.uri || '';
+    const isUi = /a2ui|\bui\b|ag-ui|agent-ui/i.test(uri);
+
+    if (isUi) {
+      findings.push({
+        category: 'A2A UI Extension',
+        severity: 'info',
+        title: 'Agent declares an interactive UI extension (A2UI)',
+        description: `The agent advertises a UI extension (${uri}). UI payloads are delivered as A2A DataParts (e.g. MIME application/json+a2ui) and rendered by the client. The rendering host MUST treat agent-supplied UI as untrusted: sanitize/escape all content, avoid executing embedded scripts, and require user confirmation for UI-initiated actions.`,
+        evidence: uri,
+        recommendation: 'Render UI in a sandboxed surface, enforce a strict CSP, and never eval agent-provided markup or handlers.',
+      });
+    }
+
+    if (ext.required) {
+      findings.push({
+        category: 'A2A Extensions',
+        severity: 'low',
+        title: `Required extension declared: ${uri || 'unknown'}`,
+        description: 'A required extension means clients that do not implement it cannot interoperate, and they must trust the extension\'s behavior. Verify the extension URI resolves to a reviewed, trusted specification.',
+        evidence: uri,
+        recommendation: 'Prefer optional extensions; document and pin required extension versions.',
+      });
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Checks auxiliary URLs (iconUrl, documentationUrl) for insecure transport and
+ * suspicious patterns — these are fetched/rendered by clients and registries.
+ */
+function analyzeAuxiliaryUrls(card: AgentCard): Finding[] {
+  const findings: Finding[] = [];
+  const urls: Array<{ field: string; value?: string }> = [
+    { field: 'iconUrl', value: card.iconUrl },
+    { field: 'documentationUrl', value: card.documentationUrl },
+  ];
+
+  for (const { field, value } of urls) {
+    if (!value) continue;
+    if (value.startsWith('http://') && !value.includes('localhost')) {
+      findings.push({
+        category: 'Transport Security',
+        severity: 'low',
+        title: `${field} served over HTTP`,
+        description: `The agent card "${field}" points to an unencrypted HTTP URL. Clients and registries fetch this resource; HTTP exposes it to tampering.`,
+        evidence: value,
+        recommendation: `Serve ${field} over HTTPS.`,
+      });
+    }
+    for (const { pattern, name, severity } of SUSPICIOUS_URL_PATTERNS) {
+      if (pattern.test(value)) {
+        findings.push({
+          category: 'Trust & Provenance',
+          severity,
+          title: `Suspicious ${field}: ${name}`,
+          description: `The "${field}" URL matches a suspicious pattern: ${name}.`,
+          evidence: value,
+          recommendation: 'Use a verified production URL.',
+        });
+      }
+    }
   }
 
   return findings;
@@ -360,9 +670,12 @@ function analyzeCapabilities(card: AgentCard): Finding[] {
 
 // ─── Agent Card Fetching ─────────────────────────────────────────────────────
 
-async function fetchAgentCard(url: string, headers: Record<string, string> = {}): Promise<{ card: AgentCard; resolvedUrl: string }> {
+async function fetchAgentCard(url: string, headers: Record<string, string> = {}): Promise<{ card: AgentCard; resolvedUrl: string; legacyPath: boolean }> {
+  // Current A2A spec: /.well-known/agent-card.json. Legacy: /.well-known/agent.json
   const attempts = [
     url,
+    url.replace(/\/$/, '') + '/.well-known/agent-card.json',
+    new URL('/.well-known/agent-card.json', url).toString(),
     url.replace(/\/$/, '') + '/.well-known/agent.json',
     new URL('/.well-known/agent.json', url).toString(),
   ];
@@ -378,7 +691,7 @@ async function fetchAgentCard(url: string, headers: Record<string, string> = {})
       if (res.ok) {
         const data = await res.json();
         if (data && typeof data === 'object' && (data.name || data.skills || data.url)) {
-          return { card: data, resolvedUrl: attempt };
+          return { card: data, resolvedUrl: attempt, legacyPath: attempt.includes('/.well-known/agent.json') };
         }
       }
     } catch { /* try next */ }
@@ -533,11 +846,13 @@ export async function POST(request: NextRequest) {
     // Fetch agent card
     let card: AgentCard;
     let resolvedUrl: string;
+    let legacyPath = false;
 
     try {
       const result = await fetchAgentCard(agentUrl, reqHeaders);
       card = result.card;
       resolvedUrl = result.resolvedUrl;
+      legacyPath = result.legacyPath;
     } catch {
       return NextResponse.json({
         error: 'Could not fetch agent card',
@@ -556,8 +871,24 @@ export async function POST(request: NextRequest) {
     // Run all analyses
     const findings: Finding[] = [];
 
+    // Discovery path: flag legacy-only well-known location.
+    if (legacyPath) {
+      findings.push({
+        category: 'Spec Compliance',
+        severity: 'low',
+        title: 'Agent card served only at the legacy well-known path',
+        description: 'The agent card was found at /.well-known/agent.json. Current A2A revisions define the canonical discovery path as /.well-known/agent-card.json. Clients following the current spec may fail to discover this agent.',
+        evidence: resolvedUrl,
+        recommendation: 'Serve the agent card at /.well-known/agent-card.json (a redirect or copy from the legacy path is acceptable for compatibility).',
+      });
+    }
+
     findings.push(...analyzeSpecCompliance(card, resolvedUrl));
     findings.push(...analyzeAuthentication(card, resolvedUrl));
+    findings.push(...analyzeCardSignature(card));
+    findings.push(...analyzeTransports(card));
+    findings.push(...analyzeExtensions(card));
+    findings.push(...analyzeAuxiliaryUrls(card));
     findings.push(...analyzeEndpointSecurity(resolvedUrl));
     findings.push(...analyzeInjectionRisks(card));
     findings.push(...analyzeSecretLeakage(card));

@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 
 // A2A spec URLs and versions
 const A2A_SPEC = {
-  version: '2025-01-17',
+  version: '0.3.0',
   urls: {
     base: 'https://a2a-protocol.org',
-    agentCard: 'https://a2a-protocol.org/latest/',
-    authentication: 'https://a2a-protocol.org/latest/',
-    skills: 'https://a2a-protocol.org/latest/',
+    agentCard: 'https://a2a-protocol.org/latest/specification/',
+    authentication: 'https://a2a-protocol.org/latest/specification/',
+    skills: 'https://a2a-protocol.org/latest/specification/',
   },
 };
 
@@ -17,11 +17,14 @@ const A2A_COMPLIANCE_RULES = [
   { id: 'agent-card-description', name: 'Agent Description', severity: 'critical' },
   { id: 'agent-card-url', name: 'Agent URL', severity: 'critical' },
   { id: 'agent-card-version', name: 'Version', severity: 'critical' },
+  { id: 'agent-card-protocol-version', name: 'Protocol Version', severity: 'warning' },
   { id: 'agent-card-capabilities', name: 'Capabilities', severity: 'warning' },
   { id: 'agent-card-skills', name: 'Skills Declaration', severity: 'warning' },
+  { id: 'agent-card-transport', name: 'Transport Declaration', severity: 'info' },
   { id: 'agent-card-input-modes', name: 'Default Input Modes', severity: 'info' },
   { id: 'agent-card-output-modes', name: 'Default Output Modes', severity: 'info' },
-  { id: 'agent-card-authentication', name: 'Authentication', severity: 'critical' },
+  { id: 'agent-card-authentication', name: 'Security Schemes', severity: 'critical' },
+  { id: 'agent-card-signature', name: 'Card Signature', severity: 'info' },
 ];
 
 function isValidURL(url: string): boolean {
@@ -47,9 +50,12 @@ async function fetchAgentCard(
   // 3. /agent.json appended to the origin/path
   const urlsToTry: string[] = [baseUrl];
 
-  // If the URL doesn't already end with .json, try well-known paths
+  // If the URL doesn't already end with .json, try well-known paths.
+  // Current A2A spec: /.well-known/agent-card.json. Legacy: /.well-known/agent.json
   if (!baseUrl.endsWith('.json')) {
     const base = urlObj.origin + urlObj.pathname.replace(/\/+$/, '');
+    urlsToTry.push(`${base}/.well-known/agent-card.json`);
+    urlsToTry.push(`${urlObj.origin}/.well-known/agent-card.json`);
     urlsToTry.push(`${base}/.well-known/agent.json`);
     urlsToTry.push(`${urlObj.origin}/.well-known/agent.json`);
   }
@@ -179,6 +185,13 @@ export async function POST(request: NextRequest) {
           message = passed ? `Version present: ${agentCard.version}` : 'MISSING: Agent card must have "version" field.';
           if (!passed) docUrl = A2A_SPEC.urls.agentCard;
           break;
+        case 'agent-card-protocol-version':
+          passed = !!agentCard?.protocolVersion;
+          message = passed
+            ? `Protocol version declared: ${agentCard.protocolVersion}`
+            : 'Not declared: current A2A revisions expect a "protocolVersion" field for compatibility negotiation.';
+          if (!passed) docUrl = A2A_SPEC.urls.agentCard;
+          break;
         case 'agent-card-capabilities':
           passed = !!agentCard?.capabilities;
           message = passed ? 'Capabilities declared' : 'MISSING: Agent card should declare "capabilities".';
@@ -193,6 +206,22 @@ export async function POST(request: NextRequest) {
             docUrl = A2A_SPEC.urls.skills;
           }
           break;
+        case 'agent-card-transport': {
+          const interfaces = [
+            ...(Array.isArray(agentCard?.additionalInterfaces) ? agentCard.additionalInterfaces : []),
+            ...(Array.isArray(agentCard?.supportedInterfaces) ? agentCard.supportedInterfaces : []),
+          ];
+          const transports = [
+            agentCard?.preferredTransport,
+            ...interfaces.map((i: { transport?: string; protocolBinding?: string }) => i.transport || i.protocolBinding),
+          ].filter(Boolean);
+          passed = transports.length > 0;
+          message = passed
+            ? `Transport(s) declared: ${[...new Set(transports)].join(', ')}`
+            : 'Not declared: agent does not specify "preferredTransport" or "additionalInterfaces". Clients default to JSONRPC.';
+          if (!passed) docUrl = A2A_SPEC.urls.agentCard;
+          break;
+        }
         case 'agent-card-input-modes':
           passed = Array.isArray(agentCard?.defaultInputModes) && agentCard.defaultInputModes.length > 0;
           if (passed) {
@@ -211,12 +240,27 @@ export async function POST(request: NextRequest) {
             docUrl = A2A_SPEC.urls.agentCard;
           }
           break;
-        case 'agent-card-authentication':
-          passed = !!(agentCard?.authentication?.schemes?.length > 0);
+        case 'agent-card-authentication': {
+          const modernSchemes = agentCard?.securitySchemes && Object.keys(agentCard.securitySchemes).length > 0;
+          const hasSecurityReq = Array.isArray(agentCard?.security) && agentCard.security.length > 0;
+          const legacySchemes = agentCard?.authentication?.schemes?.length > 0;
+          passed = !!(modernSchemes || hasSecurityReq || legacySchemes);
+          if (modernSchemes) {
+            message = `Security schemes declared: ${Object.keys(agentCard.securitySchemes).join(', ')}${hasSecurityReq ? '' : ' (note: no top-level "security" requirement set)'}`;
+          } else if (legacySchemes) {
+            message = `Legacy authentication schemes: ${agentCard.authentication.schemes.join(', ')} — migrate to "securitySchemes"/"security".`;
+          } else {
+            message = 'MISSING: Agent card must declare "securitySchemes" and a "security" requirement (or legacy "authentication").';
+            docUrl = A2A_SPEC.urls.authentication;
+          }
+          break;
+        }
+        case 'agent-card-signature':
+          passed = Array.isArray(agentCard?.signatures) && agentCard.signatures.length > 0;
           message = passed
-            ? `Authentication schemes: ${agentCard.authentication.schemes.join(', ')}`
-            : 'MISSING: Agent card must declare "authentication" with schemes.';
-          if (!passed) docUrl = A2A_SPEC.urls.authentication;
+            ? `Agent card is JWS-signed (${agentCard.signatures.length} signature(s))`
+            : 'Not signed: A2A supports JWS-signed agent cards (AgentCardSignature) so clients can verify integrity. Unsigned cards can be tampered with.';
+          if (!passed) docUrl = A2A_SPEC.urls.agentCard;
           break;
       }
 

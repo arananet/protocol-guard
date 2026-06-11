@@ -6,19 +6,38 @@ import type {
   MCPInitializeResponse,
 } from '../types';
 
+// Published MCP revisions; those predating the hardened OAuth Resource Server model.
+export const MCP_KNOWN_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+export const MCP_DEPRECATED_VERSIONS: Record<string, string> = {
+  '2024-11-05': 'no standardized authorization framework',
+  '2025-03-26': 'OAuth 2.1 without Resource Indicators (RFC 8707)',
+};
+
 export const MCP_COMPLIANCE_RULES: ComplianceRule[] = [
   {
     id: 'protocol-version',
     name: 'Protocol Version',
-    description: 'Server must return a valid protocol version',
+    description: 'Server must return a valid, current protocol version',
     severity: 'critical',
     check: (_server, response) => {
       const result = response as MCPInitializeResponse;
-      const hasVersion = !!result.protocolVersion;
+      const version = result.protocolVersion;
+      const hasVersion = !!version;
+      const deprecation = version ? MCP_DEPRECATED_VERSIONS[version] : undefined;
+      let message: string;
+      if (!hasVersion) {
+        message = 'Missing protocol version';
+      } else if (deprecation) {
+        message = `Protocol version "${version}" is deprecated (${deprecation}). Upgrade to 2025-06-18 or later.`;
+      } else if (!MCP_KNOWN_VERSIONS.includes(version!)) {
+        message = `Protocol version present but unrecognized: "${version}"`;
+      } else {
+        message = `Protocol version present: ${version}`;
+      }
       return {
         passed: hasVersion,
         ruleId: 'protocol-version',
-        message: hasVersion ? 'Protocol version present' : 'Missing protocol version',
+        message,
         severity: 'critical',
       };
     },

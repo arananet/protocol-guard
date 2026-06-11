@@ -184,6 +184,28 @@ const ARG_INJECTION_PARAM_NAMES = [
   'cli_args', 'params', 'flags', 'options',
 ];
 
+// ─── MCP Protocol Version Awareness ─────────────────────────────────────────
+// The scanner negotiates the latest spec revision and downgrades gracefully.
+// Security-relevant milestones:
+//   2024-11-05 — original revision, NO authorization framework
+//   2025-03-26 — OAuth 2.1 introduced, but WITHOUT Resource Indicators (RFC 8707)
+//   2025-06-18 — MCP servers classified as OAuth Resource Servers, Resource
+//                Indicators (RFC 8707) + Protected Resource Metadata (RFC 9728)
+//                REQUIRED, dedicated security best-practices page, structured
+//                tool output, tool annotations, elicitation
+//   2025-11-25 — latest revision, further auth + transport hardening
+
+const MCP_LATEST_VERSION = '2025-11-25';
+const MCP_PREFERRED_VERSION = '2025-06-18';
+
+const MCP_KNOWN_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+
+// Versions that predate the hardened OAuth Resource Server / Resource Indicator model
+const MCP_DEPRECATED_VERSIONS: Record<string, string> = {
+  '2024-11-05': 'No standardized authorization framework — predates OAuth 2.1 support entirely.',
+  '2025-03-26': 'OAuth 2.1 present but predates Resource Indicators (RFC 8707) and the Protected Resource Metadata model, leaving tokens vulnerable to passthrough / confused-deputy attacks.',
+};
+
 type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
 interface Finding {
@@ -202,6 +224,14 @@ interface Finding {
   evidence?: string;
 }
 
+interface MCPToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
 interface MCPTool {
   name: string;
   description?: string;
@@ -209,7 +239,35 @@ interface MCPTool {
     type?: string;
     properties?: Record<string, { type?: string; description?: string }>;
     required?: string[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    additionalProperties?: any;
   };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  outputSchema?: any;
+  annotations?: MCPToolAnnotations;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  _meta?: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+interface MCPResource {
+  uri?: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  _meta?: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+interface MCPPrompt {
+  name?: string;
+  description?: string;
+  arguments?: Array<{ name?: string; description?: string; required?: boolean }>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
 }
 
 // ─── Analysis Functions ──────────────────────────────────────────────────────
@@ -943,6 +1001,385 @@ function analyzeToolForArgumentInjection(tool: MCPTool): Finding[] {
   return findings;
 }
 
+// ─── Protocol Version Analysis ───────────────────────────────────────────────
+
+/**
+ * Flags servers that negotiate a deprecated MCP protocol revision. Older
+ * revisions lack the OAuth Resource Server classification, Resource Indicators
+ * (RFC 8707) and Protected Resource Metadata (RFC 9728) that mitigate token
+ * passthrough and confused-deputy attacks.
+ */
+function analyzeProtocolVersion(negotiatedVersion: string | undefined): Finding[] {
+  const findings: Finding[] = [];
+  if (!negotiatedVersion) return findings;
+
+  if (!MCP_KNOWN_VERSIONS.includes(negotiatedVersion)) {
+    findings.push({
+      owaspId: 'MCP04',
+      owaspTitle: OWASP_MCP_TOP_10.MCP04.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP04.url,
+      severity: 'low',
+      category: 'Protocol Version',
+      title: `Server negotiated an unrecognized protocol version (${negotiatedVersion})`,
+      description: `The server negotiated protocol version "${negotiatedVersion}", which is not a published MCP revision. Custom or pre-release revisions may not implement the security guarantees of the official specification.`,
+      evidence: negotiatedVersion,
+    });
+    return findings;
+  }
+
+  const deprecationReason = MCP_DEPRECATED_VERSIONS[negotiatedVersion];
+  if (deprecationReason) {
+    findings.push({
+      owaspId: 'MCP07',
+      owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+      severity: 'medium',
+      category: 'Protocol Version',
+      title: `Server uses a deprecated MCP protocol version (${negotiatedVersion})`,
+      description: `${deprecationReason} Upgrade to ${MCP_PREFERRED_VERSION} or later, which classifies MCP servers as OAuth Resource Servers and mandates Resource Indicators and Protected Resource Metadata.`,
+      evidence: `Negotiated ${negotiatedVersion}; latest is ${MCP_LATEST_VERSION}`,
+    });
+  }
+
+  return findings;
+}
+
+// ─── OAuth 2.1 / Authorization Metadata (RFC 9728 / RFC 8707) ────────────────
+
+/**
+ * Probes for OAuth 2.1 Protected Resource Metadata (RFC 9728) and inspects the
+ * WWW-Authenticate challenge. The 2025-06-18 spec requires unauthenticated
+ * requests to a protected server to return 401 with a resource_metadata pointer
+ * so clients can discover the authorization server and request audience-bound
+ * tokens (Resource Indicators, RFC 8707).
+ */
+async function analyzeAuthorizationMetadata(
+  serverUrl: string,
+  reqHeaders: Record<string, string>,
+  authType: string | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  unauthInitResult: any,
+  wwwAuthenticate: string | null
+): Promise<Finding[]> {
+  const findings: Finding[] = [];
+
+  // Only meaningful for remote (non-localhost) HTTPS/HTTP servers
+  const isLocal = serverUrl.includes('localhost') || serverUrl.includes('127.0.0.1');
+
+  let prmFound = false;
+  try {
+    const origin = new URL(serverUrl).origin;
+    const prmRes = await fetch(`${origin}/.well-known/oauth-protected-resource`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (prmRes.ok) {
+      const prm = await prmRes.json().catch(() => null);
+      if (prm && (prm.authorization_servers || prm.resource)) {
+        prmFound = true;
+      }
+    }
+  } catch {
+    /* metadata endpoint not reachable */
+  }
+
+  // If the server answered the unauthenticated initialize successfully AND exposes
+  // no authorization metadata, it is effectively open.
+  if ((!authType || authType === 'none') && unauthInitResult && !prmFound && !isLocal) {
+    findings.push({
+      owaspId: 'MCP07',
+      owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+      msssId: 'MCP-AUTHZ-01',
+      msssLevel: 'L3',
+      severity: 'high',
+      category: 'Authorization',
+      title: 'No OAuth 2.1 authorization — server is openly accessible',
+      description: 'The server accepted an unauthenticated initialize and exposes no Protected Resource Metadata (RFC 9728) at /.well-known/oauth-protected-resource. Per MCP 2025-06-18, remote servers should act as OAuth 2.1 Resource Servers and advertise their authorization server so clients can obtain audience-bound tokens.',
+      evidence: 'No /.well-known/oauth-protected-resource and unauthenticated initialize succeeded',
+    });
+  }
+
+  // Server challenges for auth but does not point to its resource metadata.
+  if (wwwAuthenticate && !/resource_metadata/i.test(wwwAuthenticate) && !prmFound) {
+    findings.push({
+      owaspId: 'MCP07',
+      owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+      severity: 'low',
+      category: 'Authorization',
+      title: 'WWW-Authenticate challenge omits resource_metadata pointer',
+      description: 'The server returns a 401 challenge but the WWW-Authenticate header does not include a resource_metadata parameter. RFC 9728 / MCP 2025-06-18 expect this so clients can discover the authorization server and request audience-restricted tokens.',
+      evidence: wwwAuthenticate.substring(0, 120),
+    });
+  }
+
+  return findings;
+}
+
+// ─── Tool Annotations (2025-06-18+) ──────────────────────────────────────────
+
+const MUTATING_TOOL_HINTS = [
+  /\bdelete\b/i, /\bremove\b/i, /\bdrop\b/i, /\bwrite\b/i, /\bupdate\b/i,
+  /\bcreate\b/i, /\bmodify\b/i, /\bsend\b/i, /\bexecute\b/i, /\bpurchase\b/i,
+  /\btransfer\b/i, /\brevoke\b/i, /\boverwrite\b/i, /\bdeploy\b/i, /\bpush\b/i,
+];
+
+/**
+ * Tools that appear to mutate state should declare ToolAnnotations
+ * (readOnlyHint / destructiveHint / idempotentHint / openWorldHint) so hosts can
+ * make informed trust and confirmation decisions. Note: annotations are hints
+ * and MUST NOT be relied upon for security enforcement.
+ */
+function analyzeToolAnnotations(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const name = tool.name || '';
+  const desc = tool.description || '';
+  const looksMutating = MUTATING_TOOL_HINTS.some(p => p.test(name) || p.test(desc));
+
+  if (looksMutating && !tool.annotations) {
+    findings.push({
+      owaspId: 'MCP02',
+      owaspTitle: OWASP_MCP_TOP_10.MCP02.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP02.url,
+      severity: 'low',
+      category: 'Tool Annotations',
+      title: 'State-changing tool declares no annotations',
+      description: `The tool "${tool.name}" appears to modify state but declares no ToolAnnotations. Without readOnlyHint/destructiveHint/idempotentHint, a host cannot prompt for confirmation on destructive actions. (Annotations are advisory hints, not a security control.)`,
+      toolName: tool.name,
+      evidence: name,
+    });
+  }
+
+  // A tool marked readOnly whose name/description strongly implies mutation is suspicious.
+  if (tool.annotations?.readOnlyHint === true && looksMutating) {
+    findings.push({
+      owaspId: 'MCP03',
+      owaspTitle: OWASP_MCP_TOP_10.MCP03.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP03.url,
+      severity: 'medium',
+      category: 'Tool Annotations',
+      title: 'Tool claims readOnlyHint but appears to modify state',
+      description: `The tool "${tool.name}" is annotated readOnlyHint: true yet its name/description implies state changes. Misleading annotations can trick a host into skipping user confirmation. Annotations must never be trusted as a security boundary.`,
+      toolName: tool.name,
+      evidence: `readOnlyHint: true on "${tool.name}"`,
+    });
+  }
+
+  return findings;
+}
+
+// ─── MCP Apps / Interactive UI Extension (SEP-1865) ──────────────────────────
+// UI resources use the ui:// scheme and are linked from tools via _meta. Host
+// security obligations: sandboxed iframes, CSP from resource metadata, audited
+// postMessage JSON-RPC, and explicit consent for UI-initiated tool calls.
+
+const UI_META_KEYS = [
+  'openai/outputTemplate', 'openai/output_template',
+  'mcp/ui', 'mcpui', 'ui', 'mcp-apps', 'apps/ui',
+];
+
+function getUiTemplateRef(meta: Record<string, unknown> | undefined): string | null {
+  if (!meta || typeof meta !== 'object') return null;
+  for (const key of Object.keys(meta)) {
+    const lower = key.toLowerCase();
+    if (UI_META_KEYS.some(k => lower === k.toLowerCase()) || lower.includes('outputtemplate') || lower.includes('ui')) {
+      const val = meta[key];
+      if (typeof val === 'string') return val;
+      if (val && typeof val === 'object') return JSON.stringify(val);
+    }
+  }
+  return null;
+}
+
+function isUiResource(resource: MCPResource): boolean {
+  const uri = (resource.uri || '').toLowerCase();
+  const mime = (resource.mimeType || '').toLowerCase();
+  return uri.startsWith('ui://') || mime === 'text/html' || mime === 'text/uri-list' || mime.includes('html');
+}
+
+/**
+ * Detects MCP Apps / interactive UI surfaces and flags the host-side security
+ * obligations that apply when rendering server-provided HTML.
+ */
+function analyzeUIExtension(tools: MCPTool[], resources: MCPResource[]): Finding[] {
+  const findings: Finding[] = [];
+
+  const uiResources = resources.filter(isUiResource);
+  const uiTools = tools.filter(t => getUiTemplateRef(t._meta) !== null);
+
+  if (uiResources.length === 0 && uiTools.length === 0) return findings;
+
+  findings.push({
+    owaspId: 'MCP03',
+    owaspTitle: OWASP_MCP_TOP_10.MCP03.title,
+    owaspUrl: OWASP_MCP_TOP_10.MCP03.url,
+    severity: 'info',
+    category: 'MCP Apps / UI',
+    title: 'Server ships interactive UI (MCP Apps extension)',
+    description: `Detected ${uiResources.length} UI resource(s) and ${uiTools.length} UI-linked tool(s). Per the MCP Apps extension (SEP-1865), the host MUST render this content in a sandboxed iframe with restricted permissions, enforce a Content-Security-Policy derived from the resource metadata, treat all postMessage traffic as auditable JSON-RPC, and require explicit user consent for any UI-initiated tool call.`,
+    evidence: [...uiResources.map(r => r.uri), ...uiTools.map(t => t.name)].filter(Boolean).slice(0, 5).join(', '),
+  });
+
+  // External-origin UI content is higher risk: it can load attacker-controlled scripts.
+  for (const r of uiResources) {
+    const html = `${r.description || ''} ${JSON.stringify(r._meta || {})}`;
+    const externalSrc = html.match(/https?:\/\/[^\s"'<>]+/i);
+    if (externalSrc && !/modelcontextprotocol|localhost|127\.0\.0\.1/i.test(externalSrc[0])) {
+      findings.push({
+        owaspId: 'MCP03',
+        owaspTitle: OWASP_MCP_TOP_10.MCP03.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP03.url,
+        severity: 'medium',
+        category: 'MCP Apps / UI',
+        title: 'UI resource references external origin',
+        description: `The UI resource "${r.uri || r.name}" references an external URL. Loading third-party scripts or frames into a UI template widens the attack surface for cross-site scripting and data exfiltration from the rendered view. Pin UI assets to the server origin and enforce a strict CSP.`,
+        evidence: externalSrc[0].substring(0, 120),
+      });
+    }
+
+    // UI HTML carrying hidden instructions is a poisoning vector for the agent.
+    for (const pattern of HIDDEN_INSTRUCTION_PATTERNS) {
+      if (pattern.test(html)) {
+        findings.push({
+          owaspId: 'MCP06',
+          owaspTitle: OWASP_MCP_TOP_10.MCP06.title,
+          owaspUrl: OWASP_MCP_TOP_10.MCP06.url,
+          severity: 'high',
+          category: 'MCP Apps / UI',
+          title: 'Hidden instructions in UI resource',
+          description: `The UI resource "${r.uri || r.name}" contains hidden-instruction patterns. Rendered UI text can be read back into model context and used to subvert the agent's intent.`,
+          evidence: pattern.source,
+        });
+        break;
+      }
+    }
+  }
+
+  return findings;
+}
+
+// ─── Resources & Prompts Analysis ────────────────────────────────────────────
+
+const SENSITIVE_RESOURCE_URI_PATTERNS = [
+  /file:\/\/.*\/(etc|root|home|users|var|proc|sys)\b/i,
+  /\.env\b/i, /id_rsa/i, /\.ssh/i, /credentials/i, /\.aws/i, /\.kube/i,
+  /passwd/i, /shadow/i, /\.pem\b/i, /\.key\b/i,
+];
+
+function analyzeResources(resources: MCPResource[]): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const r of resources) {
+    const uri = r.uri || '';
+
+    // Local filesystem resources exposed over a remote server are a disclosure risk.
+    if (/^file:\/\//i.test(uri)) {
+      findings.push({
+        owaspId: 'MCP10',
+        owaspTitle: OWASP_MCP_TOP_10.MCP10.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP10.url,
+        severity: 'low',
+        category: 'Resource Exposure',
+        title: 'Resource exposes a local filesystem path',
+        description: `The resource "${r.name || uri}" uses a file:// URI. Exposing host filesystem resources over MCP can leak local files into model context.`,
+        evidence: uri.substring(0, 120),
+      });
+    }
+
+    for (const pattern of SENSITIVE_RESOURCE_URI_PATTERNS) {
+      if (pattern.test(uri) || pattern.test(r.name || '') || pattern.test(r.description || '')) {
+        findings.push({
+          owaspId: 'MCP01',
+          owaspTitle: OWASP_MCP_TOP_10.MCP01.title,
+          owaspUrl: OWASP_MCP_TOP_10.MCP01.url,
+          severity: 'high',
+          category: 'Resource Exposure',
+          title: 'Resource references a sensitive location',
+          description: `The resource "${r.name || uri}" references a sensitive path or credential store. Such resources can expose secrets if read into context.`,
+          evidence: (uri || r.name || '').substring(0, 120),
+        });
+        break;
+      }
+    }
+
+    // Prompt-injection patterns embedded in resource descriptions.
+    for (const pattern of HIDDEN_INSTRUCTION_PATTERNS) {
+      if (pattern.test(r.description || '')) {
+        findings.push({
+          owaspId: 'MCP06',
+          owaspTitle: OWASP_MCP_TOP_10.MCP06.title,
+          owaspUrl: OWASP_MCP_TOP_10.MCP06.url,
+          severity: 'high',
+          category: 'Resource Poisoning',
+          title: 'Hidden instructions in resource description',
+          description: `The resource "${r.name || uri}" description contains hidden-instruction patterns that could manipulate the agent when the resource is surfaced.`,
+          evidence: pattern.source,
+        });
+        break;
+      }
+    }
+  }
+
+  return findings;
+}
+
+function analyzePrompts(prompts: MCPPrompt[]): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const p of prompts) {
+    const text = `${p.description || ''} ${JSON.stringify(p.arguments || [])}`;
+    for (const pattern of HIDDEN_INSTRUCTION_PATTERNS.concat(SHADOWING_PATTERNS)) {
+      if (pattern.test(text)) {
+        findings.push({
+          owaspId: 'MCP06',
+          owaspTitle: OWASP_MCP_TOP_10.MCP06.title,
+          owaspUrl: OWASP_MCP_TOP_10.MCP06.url,
+          severity: 'high',
+          category: 'Prompt Poisoning',
+          title: 'Hidden / intent-subverting instructions in prompt template',
+          description: `The prompt "${p.name || 'unnamed'}" contains patterns that could hijack the agent's intent when the prompt is expanded into context.`,
+          toolName: p.name,
+          evidence: pattern.source,
+        });
+        break;
+      }
+    }
+  }
+
+  return findings;
+}
+
+// ─── Lethal Trifecta (untrusted input + private data + exfiltration) ─────────
+// A single server that can ingest untrusted content, access private data, AND
+// communicate externally enables prompt-injection-driven data exfiltration.
+
+function analyzeLethalTrifecta(tools: MCPTool[]): Finding[] {
+  const findings: Finding[] = [];
+
+  const blob = tools.map(t => `${t.name} ${t.description || ''}`).join(' ').toLowerCase();
+
+  const ingestsUntrusted = /\b(fetch|browse|crawl|read[_ ]?url|scrape|http|web|email|inbox|message|webhook|rss|document)\b/.test(blob);
+  const accessesPrivate = /\b(database|secret|credential|token|private|internal|file|filesystem|env|config|customer|account|record)\b/.test(blob);
+  const canExfiltrate = /\b(send|post|upload|publish|email|webhook|notify|http|request|export|share|message)\b/.test(blob);
+
+  if (ingestsUntrusted && accessesPrivate && canExfiltrate) {
+    findings.push({
+      owaspId: 'MCP10',
+      owaspTitle: OWASP_MCP_TOP_10.MCP10.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP10.url,
+      severity: 'medium',
+      category: 'Lethal Trifecta',
+      title: 'Server combines untrusted input, private data access, and external communication',
+      description: 'This server exposes tools that can (1) ingest untrusted external content, (2) access private/internal data, and (3) communicate externally. Together these form the "lethal trifecta": a prompt-injection payload in untrusted content can coerce the agent into exfiltrating private data. Separate these capabilities across trust boundaries or require human approval for outbound actions.',
+      evidence: 'untrusted-ingest + private-data + external-send capabilities co-located',
+    });
+  }
+
+  return findings;
+}
+
 // ─── Main Handler ────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -978,13 +1415,16 @@ export async function POST(request: NextRequest) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let initResult: any = null;
     let tools: MCPTool[] = [];
+    let resources: MCPResource[] = [];
+    let prompts: MCPPrompt[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let rawInit: any = null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let rawTools: any = null;
     let responseHeaders: Headers | null = null;
+    let wwwAuthenticate: string | null = null;
 
-    // Step 1: Initialize
+    // Step 1: Initialize — negotiate the latest spec revision
     try {
       const initResponse = await fetch(serverUrl, {
         method: 'POST',
@@ -994,7 +1434,7 @@ export async function POST(request: NextRequest) {
           id: 1,
           method: 'initialize',
           params: {
-            protocolVersion: '2024-11-05',
+            protocolVersion: MCP_PREFERRED_VERSION,
             capabilities: {},
             clientInfo: { name: 'protocol-guard-scanner', version: '1.0.0' },
           },
@@ -1002,6 +1442,7 @@ export async function POST(request: NextRequest) {
       });
 
       responseHeaders = initResponse.headers;
+      wwwAuthenticate = initResponse.headers.get('www-authenticate');
       rawInit = await parseResponse(initResponse);
       initResult = rawInit?.result || rawInit;
     } catch (err) {
@@ -1019,6 +1460,12 @@ export async function POST(request: NextRequest) {
         }],
         summary: { critical: 0, high: 1, medium: 0, low: 0, info: 0, total: 1 },
       });
+    }
+
+    // Per MCP 2025-06-18, clients echo the negotiated version on later HTTP requests.
+    const negotiatedVersion: string | undefined = initResult?.protocolVersion;
+    if (negotiatedVersion) {
+      reqHeaders['MCP-Protocol-Version'] = negotiatedVersion;
     }
 
     // Send initialized notification
@@ -1050,8 +1497,37 @@ export async function POST(request: NextRequest) {
       // tools/list not supported
     }
 
+    // Step 2b: List resources (best-effort — only if capability declared or simply try)
+    try {
+      const resResponse = await fetch(serverUrl, {
+        method: 'POST',
+        headers: reqHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} }),
+      });
+      const parsed = await parseResponse(resResponse);
+      resources = (parsed?.result || parsed)?.resources || [];
+    } catch {
+      // resources/list not supported
+    }
+
+    // Step 2c: List prompts (best-effort)
+    try {
+      const promptResponse = await fetch(serverUrl, {
+        method: 'POST',
+        headers: reqHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'prompts/list', params: {} }),
+      });
+      const parsed = await parseResponse(promptResponse);
+      prompts = (parsed?.result || parsed)?.prompts || [];
+    } catch {
+      // prompts/list not supported
+    }
+
     // Step 3: Run analysis
     const findings: Finding[] = [];
+
+    // Protocol version / spec revision checks
+    findings.push(...analyzeProtocolVersion(negotiatedVersion));
 
     // Server-level checks
     findings.push(...analyzeServerCapabilities(
@@ -1062,6 +1538,9 @@ export async function POST(request: NextRequest) {
 
     // Authentication posture
     findings.push(...analyzeAuthenticationPosture(authType, !!initResult));
+
+    // OAuth 2.1 authorization metadata (RFC 9728 / RFC 8707)
+    findings.push(...await analyzeAuthorizationMetadata(serverUrl, reqHeaders, authType, initResult, wwwAuthenticate));
 
     // Instructions field analysis
     findings.push(...analyzeInstructionsField(initResult));
@@ -1089,10 +1568,20 @@ export async function POST(request: NextRequest) {
       findings.push(...analyzeToolForSSRF(tool));                // MCP-NET-01
       findings.push(...analyzeToolForPathTraversal(tool));       // MCP-FS-01 + MCP-FS-02
       findings.push(...analyzeToolForArgumentInjection(tool));   // MCP-EXEC-03
+      // 2025-06-18+ spec checks
+      findings.push(...analyzeToolAnnotations(tool));
     }
+
+    // Resources, prompts and interactive-UI (MCP Apps) checks
+    findings.push(...analyzeResources(resources));
+    findings.push(...analyzePrompts(prompts));
+    findings.push(...analyzeUIExtension(tools, resources));
 
     // Cross-tool checks
     findings.push(...analyzeCrossToolViolations(tools));
+
+    // Aggregate / multi-tool risk
+    findings.push(...analyzeLethalTrifecta(tools));
 
     // Generate summary
     const summary = {
@@ -1126,7 +1615,11 @@ export async function POST(request: NextRequest) {
       timestamp: new Date().toISOString(),
       serverUrl,
       serverInfo: initResult?.serverInfo || null,
+      protocolVersion: negotiatedVersion || null,
+      latestProtocolVersion: MCP_LATEST_VERSION,
       toolsCount: tools.length,
+      resourcesCount: resources.length,
+      promptsCount: prompts.length,
       findings,
       summary,
       owaspCoverage,

@@ -2,13 +2,23 @@ import { NextRequest, NextResponse } from 'next/server';
 
 // MCP spec URLs and versions for reference
 const MCP_SPEC = {
-  version: '2024-11-05',
+  // Version the scanner negotiates with the server (latest stable revision)
+  version: '2025-06-18',
+  latestVersion: '2025-11-25',
   urls: {
     base: 'https://modelcontextprotocol.io',
-    initialize: 'https://modelcontextprotocol.io/docs/basic-concepts/',
-    authentication: 'https://modelcontextprotocol.io/docs/authentication/',
-    capabilities: 'https://modelcontextprotocol.io/docs/capabilities/',
+    initialize: 'https://modelcontextprotocol.io/specification/2025-06-18/basic',
+    authentication: 'https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization',
+    capabilities: 'https://modelcontextprotocol.io/specification/2025-06-18/architecture',
+    security: 'https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices',
   },
+};
+
+// Published MCP protocol revisions and which ones predate the hardened auth model
+const MCP_KNOWN_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+const MCP_DEPRECATED_VERSIONS: Record<string, string> = {
+  '2024-11-05': 'no standardized authorization framework',
+  '2025-03-26': 'OAuth 2.1 without Resource Indicators (RFC 8707)',
 };
 
 // MCP compliance rules
@@ -92,7 +102,7 @@ export async function POST(request: NextRequest) {
       id: 1,
       method: 'initialize',
       params: {
-        protocolVersion: '2024-11-05',
+        protocolVersion: MCP_SPEC.version,
         capabilities: {},
         clientInfo: { name: 'protocol-guard', version: '1.0.0' },
       },
@@ -235,15 +245,28 @@ export async function POST(request: NextRequest) {
       let note = '';
 
       switch (rule.id) {
-        case 'protocol-version':
-          passed = !!serverResponse?.protocolVersion;
+        case 'protocol-version': {
+          const negotiated = serverResponse?.protocolVersion;
+          passed = !!negotiated;
           if (passed) {
-            message = `Protocol version present: "${serverResponse?.protocolVersion}"`;
+            const deprecation = negotiated ? MCP_DEPRECATED_VERSIONS[negotiated] : undefined;
+            const unknown = negotiated ? !MCP_KNOWN_VERSIONS.includes(negotiated) : false;
+            if (deprecation) {
+              message = `Protocol version "${negotiated}" is DEPRECATED (${deprecation}). Upgrade to ${MCP_SPEC.version} or later for the hardened OAuth Resource Server model.`;
+              docUrl = MCP_SPEC.urls.security;
+              note = `The server negotiated an older revision. Latest is ${MCP_SPEC.latestVersion}. Pre-2025-06-18 revisions lack Resource Indicators (RFC 8707) and Protected Resource Metadata (RFC 9728).`;
+            } else if (unknown) {
+              message = `Protocol version present but unrecognized: "${negotiated}".`;
+              docUrl = MCP_SPEC.urls.initialize;
+            } else {
+              message = `Protocol version present: "${negotiated}"`;
+            }
           } else {
             message = `MISSING: Server must return "protocolVersion" in initialize response.`;
             docUrl = MCP_SPEC.urls.initialize;
           }
           break;
+        }
         case 'server-info':
           passed = !!(serverResponse?.serverInfo?.name && serverResponse?.serverInfo?.version);
           if (passed) {
@@ -326,7 +349,9 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       timestamp: new Date().toISOString(),
-      protocolVersion: MCP_SPEC.version,
+      protocolVersion: serverResponse?.protocolVersion || MCP_SPEC.version,
+      requestedVersion: MCP_SPEC.version,
+      latestVersion: MCP_SPEC.latestVersion,
       specUrl: MCP_SPEC.urls.base,
       serverName: serverResponse?.serverInfo?.name || 'Unknown',
       results,

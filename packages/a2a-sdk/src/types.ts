@@ -26,17 +26,68 @@ export interface A2AAgentCard {
   description: string;
   url: string;
   version: string;
+  /** A2A protocol revision the agent implements (e.g. "0.3.0") */
+  protocolVersion?: string;
   capabilities: A2AAgentCapabilities;
-  authentication: A2AAuthentication;
+  /** Modern OpenAPI-style security (current A2A spec) */
+  securitySchemes?: Record<string, A2ASecurityScheme>;
+  security?: Array<Record<string, string[]>>;
+  /** Deprecated — superseded by securitySchemes/security */
+  authentication?: A2AAuthentication;
+  /** Transport selection (A2A v0.2.x+) */
+  preferredTransport?: string;
+  additionalInterfaces?: A2AAgentInterface[];
+  supportedInterfaces?: A2AAgentInterface[];
+  /** JWS signatures over the canonical agent card (AgentCardSignature) */
+  signatures?: A2AAgentCardSignature[];
+  supportsAuthenticatedExtendedCard?: boolean;
+  iconUrl?: string;
+  documentationUrl?: string;
   provider?: A2AProvider;
   supportedModels?: string[];
   tags?: string[];
+}
+
+export interface A2AAgentInterface {
+  url: string;
+  /** v0.2.x/v0.3.x use `transport`; newer drafts use `protocolBinding` */
+  transport?: 'JSONRPC' | 'GRPC' | 'HTTP+JSON' | string;
+  protocolBinding?: string;
+  protocolVersion?: string;
+}
+
+export interface A2ASecurityScheme {
+  type: 'apiKey' | 'http' | 'oauth2' | 'openIdConnect' | 'mutualTLS' | string;
+  scheme?: string;
+  in?: 'header' | 'query' | 'cookie';
+  name?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+export interface A2AAgentCardSignature {
+  /** base64url-encoded JWS protected header */
+  protected: string;
+  /** base64url-encoded signature */
+  signature: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  header?: Record<string, any>;
+}
+
+export interface A2AAgentExtension {
+  uri: string;
+  description?: string;
+  required?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params?: Record<string, any>;
 }
 
 export interface A2AAgentCapabilities {
   streaming?: boolean;
   pushNotifications?: boolean;
   stateTransitionHistory?: boolean;
+  extensions?: A2AAgentExtension[];
+  extendedAgentCard?: boolean;
 }
 
 export interface A2AAuthentication {

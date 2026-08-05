@@ -1,12 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
+import {
+  MCP_DEPRECATED_VERSIONS,
+  MCP_KNOWN_VERSIONS,
+  MCP_LATEST_VERSION,
+  MCP_LEGACY_VERSIONS,
+  MCP_SPEC_URLS,
+  buildBaseHeaders,
+  cacheHintsOf,
+  collectXMcpHeaderBindings,
+  connectMCP,
+  mcpCall,
+  parseMCPResponse,
+  resultTypeOf,
+  type Json,
+  type MCPConnection,
+} from '@/lib/mcp';
 
 /**
  * MCP Security Scanner — OWASP MCP Top 10 vulnerability analysis
- * 
+ *
  * Implements checks inspired by:
  *  - OWASP MCP Top 10 (https://owasp.org/www-project-mcp-top-10/)
  *  - mcp-shield patterns (https://github.com/riseandignite/mcp-shield)
- * 
+ *
+ * Version-aware: the scanner speaks MCP 2026-07-28 (stateless, per-request
+ * metadata) and falls back to the handshake era, then audits the
+ * security-relevant surface each revision introduced.
+ *
  * All analysis is stateless — nothing is stored.
  */
 
@@ -193,18 +213,25 @@ const ARG_INJECTION_PARAM_NAMES = [
 //                Indicators (RFC 8707) + Protected Resource Metadata (RFC 9728)
 //                REQUIRED, dedicated security best-practices page, structured
 //                tool output, tool annotations, elicitation
-//   2025-11-25 — latest revision, further auth + transport hardening
+//   2025-11-25 — further auth + transport hardening; last handshake-era revision
+//   2026-07-28 — stateless protocol: no initialize handshake and no
+//                Mcp-Session-Id, mandatory server/discover, mirrored
+//                Mcp-Method/Mcp-Name headers with server-side validation
+//                (HeaderMismatch -32020), required ttlMs/cacheScope hints,
+//                RFC 9207 issuer validation, Client ID Metadata Documents
+//                superseding Dynamic Client Registration, and Roots/Sampling/
+//                Logging deprecated
+//
+// Version constants live in @/lib/mcp so every MCP route grades against the
+// same revision list.
 
-const MCP_LATEST_VERSION = '2025-11-25';
-const MCP_PREFERRED_VERSION = '2025-06-18';
-
-const MCP_KNOWN_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
-
-// Versions that predate the hardened OAuth Resource Server / Resource Indicator model
-const MCP_DEPRECATED_VERSIONS: Record<string, string> = {
-  '2024-11-05': 'No standardized authorization framework — predates OAuth 2.1 support entirely.',
-  '2025-03-26': 'OAuth 2.1 present but predates Resource Indicators (RFC 8707) and the Protected Resource Metadata model, leaving tokens vulnerable to passthrough / confused-deputy attacks.',
-};
+/** Sensitive header names that must never be fed from tool arguments. */
+const SENSITIVE_HEADER_NAMES = [
+  'authorization', 'cookie', 'set-cookie', 'proxy-authorization',
+  'x-api-key', 'apikey', 'api-key', 'x-auth-token', 'auth-token',
+  'x-access-token', 'access-token', 'x-csrf-token', 'x-forwarded-for',
+  'x-forwarded-host', 'host',
+];
 
 type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
@@ -1009,8 +1036,9 @@ function analyzeToolForArgumentInjection(tool: MCPTool): Finding[] {
  * (RFC 8707) and Protected Resource Metadata (RFC 9728) that mitigate token
  * passthrough and confused-deputy attacks.
  */
-function analyzeProtocolVersion(negotiatedVersion: string | undefined): Finding[] {
+function analyzeProtocolVersion(conn: MCPConnection): Finding[] {
   const findings: Finding[] = [];
+  const negotiatedVersion = conn.protocolVersion;
   if (!negotiatedVersion) return findings;
 
   if (!MCP_KNOWN_VERSIONS.includes(negotiatedVersion)) {
@@ -1036,8 +1064,301 @@ function analyzeProtocolVersion(negotiatedVersion: string | undefined): Finding[
       severity: 'medium',
       category: 'Protocol Version',
       title: `Server uses a deprecated MCP protocol version (${negotiatedVersion})`,
-      description: `${deprecationReason} Upgrade to ${MCP_PREFERRED_VERSION} or later, which classifies MCP servers as OAuth Resource Servers and mandates Resource Indicators and Protected Resource Metadata.`,
+      description: `${deprecationReason} Upgrade to ${MCP_LATEST_VERSION}, which classifies MCP servers as OAuth Resource Servers, mandates Resource Indicators and Protected Resource Metadata, and adds RFC 9207 issuer validation.`,
       evidence: `Negotiated ${negotiatedVersion}; latest is ${MCP_LATEST_VERSION}`,
+    });
+  } else if (MCP_LEGACY_VERSIONS.includes(negotiatedVersion)) {
+    findings.push({
+      owaspId: 'MCP04',
+      owaspTitle: OWASP_MCP_TOP_10.MCP04.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP04.url,
+      severity: 'low',
+      category: 'Protocol Version',
+      title: `Server implements a superseded revision (${negotiatedVersion})`,
+      description: `The server speaks the handshake era (initialize / Mcp-Session-Id). MCP ${MCP_LATEST_VERSION} replaced it with a stateless model whose security-relevant additions this server does not have: server-side validation of the mirrored Mcp-Method / Mcp-Name headers (so gateways and WAFs cannot be routed one way while the server executes another), RFC 9207 issuer validation on authorization responses, and Client ID Metadata Documents in place of Dynamic Client Registration.`,
+      evidence: `Negotiated ${negotiatedVersion}; latest is ${MCP_LATEST_VERSION}`,
+    });
+  }
+
+  if (conn.era === 'modern' && !conn.probe.discoverImplemented) {
+    findings.push({
+      owaspId: 'MCP09',
+      owaspTitle: OWASP_MCP_TOP_10.MCP09.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP09.url,
+      severity: 'low',
+      category: 'Protocol Version',
+      title: 'Server does not implement server/discover',
+      description: `The server accepts stateless requests but does not answer "server/discover", which ${MCP_LATEST_VERSION} makes a MUST. Clients and inventory tooling rely on it to enumerate supported versions, capabilities and server identity; without it a server is harder to discover and govern.`,
+      evidence: conn.probe.discoverErrorCode
+        ? `server/discover returned JSON-RPC ${conn.probe.discoverErrorCode}`
+        : 'server/discover returned no result',
+    });
+  }
+
+  return findings;
+}
+
+// ─── Deprecated features (2026-07-28 feature lifecycle) ──────────────────────
+
+const DEPRECATED_CAPABILITIES: Record<string, string> = {
+  roots: 'Pass directories or files via tool parameters, resource URIs, or server configuration instead.',
+  sampling: 'Integrate directly with an LLM provider API instead of asking the client to sample.',
+  logging: 'Log to stderr (stdio) or use OpenTelemetry instead.',
+};
+
+/**
+ * Roots, Sampling and Logging entered the Deprecated state in 2026-07-28 with a
+ * minimum twelve-month removal window. Sampling in particular hands the server
+ * influence over an LLM call the user did not initiate, so continued reliance on
+ * it is worth surfacing.
+ */
+function analyzeDeprecatedFeatures(capabilities: Json): Finding[] {
+  const findings: Finding[] = [];
+  if (!capabilities || typeof capabilities !== 'object') return findings;
+
+  const declared = Object.keys(DEPRECATED_CAPABILITIES).filter(
+    (name) => capabilities[name] !== undefined
+  );
+  if (declared.length === 0) return findings;
+
+  findings.push({
+    owaspId: 'MCP02',
+    owaspTitle: OWASP_MCP_TOP_10.MCP02.title,
+    owaspUrl: OWASP_MCP_TOP_10.MCP02.url,
+    severity: 'low',
+    category: 'Deprecated Features',
+    title: `Server depends on deprecated MCP features: ${declared.join(', ')}`,
+    description: `These capabilities are Deprecated as of ${MCP_LATEST_VERSION} and are eligible for removal after a twelve-month window. ${declared
+      .map((d) => `${d}: ${DEPRECATED_CAPABILITIES[d]}`)
+      .join(' ')}`,
+    evidence: declared.join(', '),
+  });
+
+  return findings;
+}
+
+// ─── Statelessness / transport hardening (2026-07-28) ────────────────────────
+
+/**
+ * 2026-07-28 removed protocol-level sessions. A server that still mints an
+ * `Mcp-Session-Id`, or still serves the standalone SSE GET endpoint, is keeping
+ * per-connection state that requests can inherit without re-presenting their own
+ * authorization context.
+ */
+async function analyzeStatelessTransport(
+  serverUrl: string,
+  baseHeaders: Record<string, string>,
+  conn: MCPConnection
+): Promise<Finding[]> {
+  const findings: Finding[] = [];
+
+  if (conn.sessionId) {
+    findings.push({
+      owaspId: 'MCP10',
+      owaspTitle: OWASP_MCP_TOP_10.MCP10.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP10.url,
+      severity: conn.era === 'modern' ? 'medium' : 'low',
+      category: 'Statelessness',
+      title: 'Server mints a protocol-level session (Mcp-Session-Id)',
+      description: `The server returned an Mcp-Session-Id header. Protocol-level sessions were removed in ${MCP_LATEST_VERSION}: state carried on the connection rather than in each request means a later request can inherit context — capabilities, identity, resource subscriptions — it never presented credentials for, and it makes session-fixation and cross-tenant bleed possible behind a load balancer.`,
+      evidence: `Mcp-Session-Id: ${conn.sessionId}`,
+    });
+  }
+
+  // The standalone SSE GET endpoint was replaced by subscriptions/listen.
+  try {
+    const res = await fetch(serverUrl, {
+      method: 'GET',
+      headers: { ...baseHeaders, Accept: 'text/event-stream' },
+      signal: AbortSignal.timeout(5000),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('text/event-stream')) {
+      findings.push({
+        owaspId: 'MCP08',
+        owaspTitle: OWASP_MCP_TOP_10.MCP08.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP08.url,
+        severity: 'low',
+        category: 'Statelessness',
+        title: 'Server still serves a standalone SSE stream on GET',
+        description: `A GET to the MCP endpoint opened an event stream. ${MCP_LATEST_VERSION} replaced the GET endpoint (and resources/subscribe) with subscriptions/listen, and removed stream resumability; servers on the current revision answer 405 Method Not Allowed. A long-lived server-push channel outside the request/response model is a channel for server-initiated messages that no single request authorized.`,
+        evidence: `GET ${new URL(serverUrl).pathname} → ${res.status} ${contentType}`,
+      });
+    }
+    await parseMCPResponse(res).catch(() => undefined);
+  } catch {
+    /* endpoint not reachable by GET — expected on a current server */
+  }
+
+  return findings;
+}
+
+// ─── Header mirroring (x-mcp-header, 2026-07-28) ─────────────────────────────
+
+/**
+ * `x-mcp-header` mirrors tool arguments into `Mcp-Param-*` HTTP headers so
+ * intermediaries can route on them. That makes the annotation a data-egress
+ * decision: an annotated value leaves the encrypted body and becomes visible to
+ * (and loggable by) every proxy on the path.
+ */
+function analyzeToolHeaderMirroring(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const bindings = collectXMcpHeaderBindings(tool.inputSchema);
+  if (bindings.length === 0) return findings;
+
+  const invalid = bindings.filter((b) => b.violations.length > 0);
+  if (invalid.length > 0) {
+    findings.push({
+      owaspId: 'MCP03',
+      owaspTitle: OWASP_MCP_TOP_10.MCP03.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP03.url,
+      severity: 'medium',
+      category: 'Header Mirroring',
+      title: 'Tool declares invalid x-mcp-header annotations',
+      description: `The tool "${tool.name}" annotates parameters with x-mcp-header values that violate the ${MCP_LATEST_VERSION} constraints. Conforming clients MUST exclude the whole tool from tools/list; a client that does not will emit malformed headers, and CR/LF or non-token values are a header-injection vector against intermediaries.`,
+      toolName: tool.name,
+      evidence: invalid
+        .map((b) => `${b.path.join('.')} → "${b.header}": ${b.violations.join('; ')}`)
+        .join(' | ')
+        .slice(0, 300),
+    });
+  }
+
+  const sensitive = bindings.filter((b) =>
+    SENSITIVE_HEADER_NAMES.includes(b.header.toLowerCase())
+  );
+  if (sensitive.length > 0) {
+    findings.push({
+      owaspId: 'MCP01',
+      owaspTitle: OWASP_MCP_TOP_10.MCP01.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP01.url,
+      severity: 'high',
+      category: 'Header Mirroring',
+      title: 'Tool parameters are mirrored into security-sensitive headers',
+      description: `The tool "${tool.name}" asks clients to copy argument values into headers named ${sensitive
+        .map((b) => `Mcp-Param-${b.header}`)
+        .join(', ')}. Names in this family (Authorization, Cookie, API keys, forwarding headers) let a tool argument impersonate a credential or spoof an origin at any proxy that inspects them, and put the value into request logs along the whole path.`,
+      toolName: tool.name,
+      evidence: sensitive.map((b) => `${b.path.join('.')} → Mcp-Param-${b.header}`).join(', '),
+    });
+  }
+
+  const credentialish = bindings.filter(
+    (b) =>
+      !SENSITIVE_HEADER_NAMES.includes(b.header.toLowerCase()) &&
+      /token|secret|password|passwd|credential|session|bearer|signature/i.test(
+        `${b.header} ${b.path.join('.')}`
+      )
+  );
+  if (credentialish.length > 0) {
+    findings.push({
+      owaspId: 'MCP01',
+      owaspTitle: OWASP_MCP_TOP_10.MCP01.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP01.url,
+      severity: 'medium',
+      category: 'Header Mirroring',
+      title: 'Credential-shaped parameter mirrored into an HTTP header',
+      description: `The tool "${tool.name}" mirrors a parameter whose name suggests a secret into an Mcp-Param-* header. Mirrored values are readable by every intermediary on the path and routinely land in access logs; mirror only routing keys such as region or tenant.`,
+      toolName: tool.name,
+      evidence: credentialish.map((b) => `${b.path.join('.')} → Mcp-Param-${b.header}`).join(', '),
+    });
+  }
+
+  return findings;
+}
+
+// ─── Remote $ref in tool schemas (2026-07-28 JSON Schema rules) ──────────────
+
+function collectRemoteRefs(schema: Json, refs: string[] = [], depth = 0): string[] {
+  if (!schema || typeof schema !== 'object' || depth > 12) return refs;
+
+  if (typeof schema.$ref === 'string' && /^https?:\/\//i.test(schema.$ref)) {
+    refs.push(schema.$ref);
+  }
+  for (const value of Object.values(schema)) {
+    if (Array.isArray(value)) {
+      for (const item of value) collectRemoteRefs(item, refs, depth + 1);
+    } else if (value && typeof value === 'object') {
+      collectRemoteRefs(value, refs, depth + 1);
+    }
+  }
+  return refs;
+}
+
+/**
+ * JSON Schema 2020-12 lets `$ref` point at a network URI. 2026-07-28 forbids
+ * implementations from dereferencing those automatically — a server that ships
+ * them is asking clients to fetch third-party schema content, which is both an
+ * SSRF trigger and a supply-chain hook into argument validation.
+ */
+function analyzeSchemaRemoteRefs(tool: MCPTool): Finding[] {
+  const findings: Finding[] = [];
+  const refs = [
+    ...collectRemoteRefs(tool.inputSchema),
+    ...collectRemoteRefs(tool.outputSchema),
+  ];
+  if (refs.length === 0) return findings;
+
+  findings.push({
+    owaspId: 'MCP04',
+    owaspTitle: OWASP_MCP_TOP_10.MCP04.title,
+    owaspUrl: OWASP_MCP_TOP_10.MCP04.url,
+    msssId: 'MCP-NET-01',
+    msssLevel: 'L1',
+    severity: 'medium',
+    category: 'Schema Supply Chain',
+    title: 'Tool schema contains network $ref targets',
+    description: `The schema for "${tool.name}" references remote URIs. Implementations MUST NOT dereference network $refs automatically (${MCP_LATEST_VERSION}); a client that does gives the schema host control over argument validation and can be pointed at internal addresses. Inline the definitions or use local $defs.`,
+    toolName: tool.name,
+    evidence: [...new Set(refs)].slice(0, 3).join(', '),
+  });
+
+  return findings;
+}
+
+// ─── Cache hints (2026-07-28 CacheableResult) ────────────────────────────────
+
+/**
+ * `cacheScope: "public"` tells shared gateways they may serve a stored response
+ * to any caller. On a server that requires authorization, that is a cross-tenant
+ * disclosure primitive; per-user results must be `"private"`.
+ */
+function analyzeCacheHints(
+  operation: string,
+  result: Json,
+  requiresAuth: boolean,
+  era: MCPConnection['era']
+): Finding[] {
+  const findings: Finding[] = [];
+  if (!result || typeof result !== 'object') return findings;
+
+  const hints = cacheHintsOf(result);
+
+  if (hints.cacheScope === 'public' && requiresAuth) {
+    findings.push({
+      owaspId: 'MCP10',
+      owaspTitle: OWASP_MCP_TOP_10.MCP10.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP10.url,
+      severity: operation === 'resources/read' ? 'high' : 'medium',
+      category: 'Caching',
+      title: `${operation} is marked cacheScope: "public" on an authenticated server`,
+      description: `The server answered an authorized ${operation} with cacheScope "public", which permits any shared gateway or caching proxy to store the response and serve it to a different caller. Results that vary per authorization context MUST be "private" so caches are never shared across contexts.`,
+      evidence: `${operation} → cacheScope: public${hints.hasTtl ? `, ttlMs: ${hints.ttlMs}` : ''}`,
+    });
+  }
+
+  if (era === 'modern' && !hints.valid && resultTypeOf(result) !== 'input_required') {
+    findings.push({
+      owaspId: 'MCP08',
+      owaspTitle: OWASP_MCP_TOP_10.MCP08.title,
+      owaspUrl: OWASP_MCP_TOP_10.MCP08.url,
+      severity: 'info',
+      category: 'Caching',
+      title: `${operation} omits required cache hints`,
+      description: `${MCP_LATEST_VERSION} requires ttlMs (>= 0) and cacheScope ("public" or "private") on complete results from ${operation}. Without an explicit scope, intermediaries have no instruction about whether the response may be shared between callers.`,
+      evidence: `ttlMs: ${hints.hasTtl ? hints.ttlMs : 'absent'}, cacheScope: ${
+        hints.hasScope ? hints.cacheScope : 'absent'
+      }`,
     });
   }
 
@@ -1055,10 +1376,8 @@ function analyzeProtocolVersion(negotiatedVersion: string | undefined): Finding[
  */
 async function analyzeAuthorizationMetadata(
   serverUrl: string,
-  reqHeaders: Record<string, string>,
   authType: string | undefined,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  unauthInitResult: any,
+  connected: boolean,
   wwwAuthenticate: string | null
 ): Promise<Finding[]> {
   const findings: Finding[] = [];
@@ -1067,6 +1386,7 @@ async function analyzeAuthorizationMetadata(
   const isLocal = serverUrl.includes('localhost') || serverUrl.includes('127.0.0.1');
 
   let prmFound = false;
+  let prmAuthorizationServers: string[] = [];
   try {
     const origin = new URL(serverUrl).origin;
     const prmRes = await fetch(`${origin}/.well-known/oauth-protected-resource`, {
@@ -1078,15 +1398,20 @@ async function analyzeAuthorizationMetadata(
       const prm = await prmRes.json().catch(() => null);
       if (prm && (prm.authorization_servers || prm.resource)) {
         prmFound = true;
+        if (Array.isArray(prm.authorization_servers)) {
+          prmAuthorizationServers = prm.authorization_servers.filter(
+            (s: unknown): s is string => typeof s === 'string'
+          );
+        }
       }
     }
   } catch {
     /* metadata endpoint not reachable */
   }
 
-  // If the server answered the unauthenticated initialize successfully AND exposes
+  // If the server answered an unauthenticated request successfully AND exposes
   // no authorization metadata, it is effectively open.
-  if ((!authType || authType === 'none') && unauthInitResult && !prmFound && !isLocal) {
+  if ((!authType || authType === 'none') && connected && !prmFound && !isLocal) {
     findings.push({
       owaspId: 'MCP07',
       owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
@@ -1096,8 +1421,8 @@ async function analyzeAuthorizationMetadata(
       severity: 'high',
       category: 'Authorization',
       title: 'No OAuth 2.1 authorization — server is openly accessible',
-      description: 'The server accepted an unauthenticated initialize and exposes no Protected Resource Metadata (RFC 9728) at /.well-known/oauth-protected-resource. Per MCP 2025-06-18, remote servers should act as OAuth 2.1 Resource Servers and advertise their authorization server so clients can obtain audience-bound tokens.',
-      evidence: 'No /.well-known/oauth-protected-resource and unauthenticated initialize succeeded',
+      description: 'The server answered an unauthenticated request and exposes no Protected Resource Metadata (RFC 9728) at /.well-known/oauth-protected-resource. Since MCP 2025-06-18, remote servers should act as OAuth 2.1 Resource Servers and advertise their authorization server so clients can obtain audience-bound tokens.',
+      evidence: 'No /.well-known/oauth-protected-resource and unauthenticated request succeeded',
     });
   }
 
@@ -1115,7 +1440,122 @@ async function analyzeAuthorizationMetadata(
     });
   }
 
+  findings.push(...(await analyzeAuthorizationServer(serverUrl, prmAuthorizationServers)));
+
   return findings;
+}
+
+// ─── Authorization server metadata (RFC 9207 / CIMD, 2026-07-28) ─────────────
+
+/**
+ * Fetches the authorization server's metadata and checks the two registration
+ * and issuer-validation requirements 2026-07-28 added:
+ *
+ *  - `authorization_response_iss_parameter_supported` (RFC 9207). Without the
+ *    `iss` parameter a client cannot tell which authorization server produced a
+ *    code, which is what makes mix-up attacks work.
+ *  - `client_id_metadata_document_supported` (CIMD). Dynamic Client
+ *    Registration is deprecated in favour of CIMD; a DCR-only server accepts
+ *    unauthenticated registrations from anyone who can reach the endpoint.
+ */
+async function analyzeAuthorizationServer(
+  serverUrl: string,
+  authorizationServers: string[]
+): Promise<Finding[]> {
+  const findings: Finding[] = [];
+
+  const candidates = authorizationServers.length
+    ? authorizationServers
+    : [new URL(serverUrl).origin];
+
+  for (const issuer of candidates.slice(0, 2)) {
+    const metadata = await fetchAuthorizationServerMetadata(issuer);
+    if (!metadata) continue;
+
+    if (metadata.authorization_response_iss_parameter_supported !== true) {
+      findings.push({
+        owaspId: 'MCP07',
+        owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+        severity: 'medium',
+        category: 'Authorization',
+        title: 'Authorization server does not advertise RFC 9207 issuer identification',
+        description: `The metadata for ${issuer} does not set authorization_response_iss_parameter_supported. MCP ${MCP_LATEST_VERSION} expects authorization servers to return the iss parameter in authorization responses and requires clients to validate it against the recorded issuer before redeeming a code. Without it, a client talking to several authorization servers cannot detect a code issued by a different one — the mix-up attack.`,
+        evidence: `${issuer} — authorization_response_iss_parameter_supported: ${
+          metadata.authorization_response_iss_parameter_supported ?? 'absent'
+        }`,
+      });
+    }
+
+    const cimd = metadata.client_id_metadata_document_supported === true;
+    const dcr = typeof metadata.registration_endpoint === 'string';
+
+    if (!cimd && dcr) {
+      findings.push({
+        owaspId: 'MCP07',
+        owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+        severity: 'low',
+        category: 'Authorization',
+        title: 'Authorization server offers only Dynamic Client Registration',
+        description: `${issuer} exposes a registration_endpoint but does not advertise client_id_metadata_document_supported. OAuth 2.0 Dynamic Client Registration (RFC 7591) is deprecated as an MCP registration mechanism as of ${MCP_LATEST_VERSION} in favour of Client ID Metadata Documents, where the client identifier is an HTTPS URL the authorization server fetches and validates. An open DCR endpoint mints client records for any caller that can reach it.`,
+        evidence: `${issuer} — registration_endpoint present, client_id_metadata_document_supported absent`,
+      });
+    }
+
+    if (!cimd && !dcr) {
+      findings.push({
+        owaspId: 'MCP07',
+        owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
+        owaspUrl: OWASP_MCP_TOP_10.MCP07.url,
+        severity: 'info',
+        category: 'Authorization',
+        title: 'Authorization server supports no automatic client registration',
+        description: `${issuer} advertises neither Client ID Metadata Documents nor a registration endpoint, so clients with no prior relationship must be registered out of band. That is a valid choice; it is listed here because ${MCP_LATEST_VERSION} expects CIMD to be the default path for clients and servers that have never met.`,
+        evidence: issuer,
+      });
+    }
+  }
+
+  return findings;
+}
+
+async function fetchAuthorizationServerMetadata(issuer: string): Promise<Json> {
+  let origin: string;
+  let pathPart: string;
+  try {
+    const url = new URL(issuer);
+    origin = url.origin;
+    pathPart = url.pathname.replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+
+  // RFC 8414 inserts the well-known segment between host and issuer path;
+  // OpenID Discovery appends it. Try both, plus the bare origin.
+  const candidates = [
+    `${origin}/.well-known/oauth-authorization-server${pathPart}`,
+    `${origin}${pathPart}/.well-known/openid-configuration`,
+    `${origin}/.well-known/openid-configuration`,
+  ];
+
+  for (const url of [...new Set(candidates)]) {
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) continue;
+      const json = await res.json().catch(() => null);
+      if (json && (json.issuer || json.authorization_endpoint || json.token_endpoint)) {
+        return json;
+      }
+    } catch {
+      /* try the next candidate */
+    }
+  }
+
+  return null;
 }
 
 // ─── Tool Annotations (2025-06-18+) ──────────────────────────────────────────
@@ -1390,64 +1830,19 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Server URL required' }, { status: 400 });
     }
 
-    const reqHeaders: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/event-stream',
-    };
+    const reqHeaders = buildBaseHeaders({ authType, authValue, authHeader, customHeaders });
 
-    if (authType && authType !== 'none' && authValue) {
-      if (authType === 'api_key') {
-        reqHeaders[authHeader || 'Authorization'] = authValue;
-      } else if (authType === 'bearer') {
-        reqHeaders[authHeader || 'Authorization'] = `Bearer ${authValue}`;
-      } else if (authType === 'basic') {
-        reqHeaders[authHeader || 'Authorization'] = `Basic ${Buffer.from(authValue).toString('base64')}`;
-      }
-    }
-
-    // Apply custom headers
-    if (Array.isArray(customHeaders)) {
-      for (const h of customHeaders) {
-        if (h.key && h.value) reqHeaders[h.key] = h.value;
-      }
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let initResult: any = null;
     let tools: MCPTool[] = [];
     let resources: MCPResource[] = [];
     let prompts: MCPPrompt[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let rawInit: any = null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let rawTools: any = null;
-    let responseHeaders: Headers | null = null;
-    let wwwAuthenticate: string | null = null;
 
-    // Step 1: Initialize — negotiate the latest spec revision
-    try {
-      const initResponse = await fetch(serverUrl, {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'initialize',
-          params: {
-            protocolVersion: MCP_PREFERRED_VERSION,
-            capabilities: {},
-            clientInfo: { name: 'protocol-guard-scanner', version: '1.0.0' },
-          },
-        }),
-      });
+    // Step 1: Connect — probe the stateless revision first, fall back to the
+    // initialize handshake, and remember which era the server speaks.
+    const conn = await connectMCP(serverUrl, reqHeaders);
 
-      responseHeaders = initResponse.headers;
-      wwwAuthenticate = initResponse.headers.get('www-authenticate');
-      rawInit = await parseResponse(initResponse);
-      initResult = rawInit?.result || rawInit;
-    } catch (err) {
+    if (conn.era === 'unknown') {
       return NextResponse.json({
-        error: `Failed to connect: ${err instanceof Error ? err.message : 'Unknown error'}`,
+        error: `Failed to connect: ${conn.error || 'Unknown error'}`,
         findings: [{
           owaspId: 'MCP07',
           owaspTitle: OWASP_MCP_TOP_10.MCP07.title,
@@ -1455,98 +1850,74 @@ export async function POST(request: NextRequest) {
           severity: 'high',
           category: 'Connection',
           title: 'Cannot connect to MCP server',
-          description: 'The scanner was unable to establish a connection to the MCP server. The server may be down, unreachable, or rejecting connections.',
+          description: 'The scanner was unable to establish a connection to the MCP server. It answered neither "server/discover" (MCP 2026-07-28) nor "initialize" (handshake era). The server may be down, unreachable, or rejecting connections.',
           evidence: serverUrl,
         }],
         summary: { critical: 0, high: 1, medium: 0, low: 0, info: 0, total: 1 },
       });
     }
 
-    // Per MCP 2025-06-18, clients echo the negotiated version on later HTTP requests.
-    const negotiatedVersion: string | undefined = initResult?.protocolVersion;
-    if (negotiatedVersion) {
-      reqHeaders['MCP-Protocol-Version'] = negotiatedVersion;
-    }
+    // Normalized handshake view: a stateless server reports its identity in the
+    // result's `_meta`, a handshake server in `initialize.serverInfo`.
+    const handshakeResult: Json = {
+      ...(conn.discover || conn.initialize || {}),
+      serverInfo: conn.serverInfo,
+      instructions: conn.instructions,
+    };
+    const responseHeaders: Headers | null = conn.headers;
+    const wwwAuthenticate: string | null = conn.wwwAuthenticate;
+    const rawInit: Json = conn.raw;
+    let rawTools: Json = null;
 
-    // Send initialized notification
-    try {
-      await fetch(serverUrl, {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
-      });
-    } catch { /* ignore */ }
+    const negotiatedVersion: string | undefined = conn.protocolVersion;
+    const requiresAuth = !!(authType && authType !== 'none');
 
-    // Step 2: List tools
-    try {
-      const toolsResponse = await fetch(serverUrl, {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          method: 'tools/list',
-          params: {},
-        }),
-      });
+    // Step 2: Enumerate tools, resources and prompts in the server's own era.
+    const toolsCall = await mcpCall(conn, serverUrl, reqHeaders, 'tools/list');
+    rawTools = toolsCall.raw;
+    tools = toolsCall.result?.tools || [];
 
-      rawTools = await parseResponse(toolsResponse);
-      const toolsResult = rawTools?.result || rawTools;
-      tools = toolsResult?.tools || [];
-    } catch {
-      // tools/list not supported
-    }
+    const resourcesCall = await mcpCall(conn, serverUrl, reqHeaders, 'resources/list');
+    resources = resourcesCall.result?.resources || [];
 
-    // Step 2b: List resources (best-effort — only if capability declared or simply try)
-    try {
-      const resResponse = await fetch(serverUrl, {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} }),
-      });
-      const parsed = await parseResponse(resResponse);
-      resources = (parsed?.result || parsed)?.resources || [];
-    } catch {
-      // resources/list not supported
-    }
-
-    // Step 2c: List prompts (best-effort)
-    try {
-      const promptResponse = await fetch(serverUrl, {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'prompts/list', params: {} }),
-      });
-      const parsed = await parseResponse(promptResponse);
-      prompts = (parsed?.result || parsed)?.prompts || [];
-    } catch {
-      // prompts/list not supported
-    }
+    const promptsCall = await mcpCall(conn, serverUrl, reqHeaders, 'prompts/list');
+    prompts = promptsCall.result?.prompts || [];
 
     // Step 3: Run analysis
     const findings: Finding[] = [];
 
     // Protocol version / spec revision checks
-    findings.push(...analyzeProtocolVersion(negotiatedVersion));
+    findings.push(...analyzeProtocolVersion(conn));
+
+    // Deprecated features (Roots / Sampling / Logging)
+    findings.push(...analyzeDeprecatedFeatures(conn.capabilities));
+
+    // Statelessness and transport hardening (2026-07-28)
+    findings.push(...await analyzeStatelessTransport(serverUrl, reqHeaders, conn));
+
+    // Cache hints on cacheable results (2026-07-28)
+    findings.push(...analyzeCacheHints('tools/list', toolsCall.result, requiresAuth, conn.era));
+    findings.push(...analyzeCacheHints('resources/list', resourcesCall.result, requiresAuth, conn.era));
+    findings.push(...analyzeCacheHints('prompts/list', promptsCall.result, requiresAuth, conn.era));
 
     // Server-level checks
     findings.push(...analyzeServerCapabilities(
-      initResult?.capabilities,
+      conn.capabilities,
       tools,
       serverUrl
     ));
 
-    // Authentication posture
-    findings.push(...analyzeAuthenticationPosture(authType, !!initResult));
+    // Authentication posture — reaching this point means the server answered.
+    findings.push(...analyzeAuthenticationPosture(authType, true));
 
-    // OAuth 2.1 authorization metadata (RFC 9728 / RFC 8707)
-    findings.push(...await analyzeAuthorizationMetadata(serverUrl, reqHeaders, authType, initResult, wwwAuthenticate));
+    // OAuth 2.1 authorization metadata (RFC 9728 / RFC 8707 / RFC 9207 / CIMD)
+    findings.push(...await analyzeAuthorizationMetadata(serverUrl, authType, true, wwwAuthenticate));
 
     // Instructions field analysis
-    findings.push(...analyzeInstructionsField(initResult));
+    findings.push(...analyzeInstructionsField(handshakeResult));
 
     // Information leakage (version, framework fingerprinting)
-    findings.push(...analyzeInformationLeakage(initResult, tools));
+    findings.push(...analyzeInformationLeakage(handshakeResult, tools));
 
     // HTTP response header analysis
     if (responseHeaders) {
@@ -1570,6 +1941,9 @@ export async function POST(request: NextRequest) {
       findings.push(...analyzeToolForArgumentInjection(tool));   // MCP-EXEC-03
       // 2025-06-18+ spec checks
       findings.push(...analyzeToolAnnotations(tool));
+      // 2026-07-28 spec checks
+      findings.push(...analyzeToolHeaderMirroring(tool));
+      findings.push(...analyzeSchemaRemoteRefs(tool));
     }
 
     // Resources, prompts and interactive-UI (MCP Apps) checks
@@ -1614,9 +1988,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       timestamp: new Date().toISOString(),
       serverUrl,
-      serverInfo: initResult?.serverInfo || null,
+      serverInfo: conn.serverInfo,
       protocolVersion: negotiatedVersion || null,
+      protocolEra: conn.era,
+      supportedVersions: conn.supportedVersions || null,
       latestProtocolVersion: MCP_LATEST_VERSION,
+      specUrl: MCP_SPEC_URLS.spec,
       toolsCount: tools.length,
       resourcesCount: resources.length,
       promptsCount: prompts.length,
@@ -1632,16 +2009,4 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function parseResponse(response: Response): Promise<any> {
-  const contentType = response.headers.get('content-type') || '';
-  if (contentType.includes('text/event-stream')) {
-    const text = await response.text();
-    const dataLine = text.split('\n').find(l => l.startsWith('data:'));
-    if (dataLine) return JSON.parse(dataLine.replace(/^data:\s*/, ''));
-    return { _rawSSE: text };
-  }
-  return response.json();
 }

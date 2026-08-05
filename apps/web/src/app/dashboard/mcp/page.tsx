@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { Navbar } from '@/components/Navbar';
+import { MCP_LATEST_VERSION } from '@/lib/mcp';
 import { AcknowledgmentGate } from '@/components/AcknowledgmentGate';
 import {
   ChevronDown, ChevronUp, ExternalLink, Server, CheckCircle, XCircle,
@@ -26,6 +27,10 @@ interface ComplianceResult {
 interface ComplianceReport {
   timestamp: string;
   protocolVersion: string;
+  requestedVersion?: string;
+  latestVersion?: string;
+  protocolEra?: 'modern' | 'legacy' | 'unknown';
+  supportedVersions?: string[] | null;
   specUrl: string;
   serverName: string;
   results: ComplianceResult[];
@@ -304,7 +309,7 @@ export default function MCPPage() {
             </p>
             <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
               <span>
-                Spec version: <span className="font-mono font-bold">2024-11-05</span>
+                Spec version: <span className="font-mono font-bold">{MCP_LATEST_VERSION}</span>
               </span>
               <span className="hidden sm:inline">·</span>
               <a href="https://modelcontextprotocol.io/docs/basic-concepts/" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline flex items-center gap-1">
@@ -465,7 +470,11 @@ export default function MCPPage() {
           {activeTab === 'compliance' && (
             <div>
               <div className="mb-4 text-sm text-muted-foreground">
-                Testing against MCP <span className="font-mono font-bold">2024-11-05</span>
+                Testing against MCP <span className="font-mono font-bold">{MCP_LATEST_VERSION}</span>.
+                The scanner probes <span className="font-mono">server/discover</span> at the stateless
+                revision first and falls back to the <span className="font-mono">initialize</span>{' '}
+                handshake for servers on {'\u2264'} 2025-11-25, then grades each server against the
+                rules for its own era.
               </div>
 
               <button
@@ -485,6 +494,16 @@ export default function MCPPage() {
                   <div className="flex items-center justify-between text-sm">
                     <div className="text-muted-foreground">
                       Protocol: <span className="font-mono font-bold">{report.protocolVersion}</span>
+                      {report.protocolEra && report.protocolEra !== 'unknown' && (
+                        <span className="ml-2 px-2 py-0.5 rounded border text-xs font-medium">
+                          {report.protocolEra === 'modern' ? 'stateless' : 'handshake era'}
+                        </span>
+                      )}
+                      {report.supportedVersions && report.supportedVersions.length > 0 && (
+                        <span className="ml-2 text-xs">
+                          supports <span className="font-mono">{report.supportedVersions.join(', ')}</span>
+                        </span>
+                      )}
                     </div>
                     <a href={report.specUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-primary hover:underline">
                       View Spec <ExternalLink className="w-3 h-3" />

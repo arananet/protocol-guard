@@ -130,8 +130,14 @@ function printReport(data, type) {
   console.log(`  Protocol Guard — ${type.toUpperCase()} Security Scan Report`);
   console.log('═'.repeat(60));
 
-  if (type === 'mcp' && serverInfo) {
-    console.log(`  Server: ${serverInfo.name || 'unknown'} v${serverInfo.version || '?'}`);
+  if (type === 'mcp' && (serverInfo || data.protocolVersion)) {
+    if (serverInfo) {
+      console.log(`  Server: ${serverInfo.name || 'unknown'} v${serverInfo.version || '?'}`);
+    }
+    if (data.protocolVersion) {
+      const era = data.protocolEra === 'modern' ? 'stateless' : data.protocolEra === 'legacy' ? 'handshake era' : '';
+      console.log(`  Spec:   ${data.protocolVersion}${era ? ` (${era})` : ''}${data.latestProtocolVersion && data.latestProtocolVersion !== data.protocolVersion ? ` — latest is ${data.latestProtocolVersion}` : ''}`);
+    }
     console.log(`  Tools:  ${data.toolsCount || 0}`);
   }
   if (type === 'a2a' && agentCard) {

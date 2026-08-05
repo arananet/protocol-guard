@@ -23,6 +23,7 @@ export default defineConfig({
       '@protocol-tester/shared': path.resolve(__dirname, './packages/shared/src'),
       '@protocol-tester/mcp-sdk': path.resolve(__dirname, './packages/mcp-sdk/src'),
       '@protocol-tester/a2a-sdk': path.resolve(__dirname, './packages/a2a-sdk/src'),
+      '@': path.resolve(__dirname, './apps/web/src'),
     },
   },
 });

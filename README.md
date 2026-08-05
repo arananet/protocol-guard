@@ -15,12 +15,19 @@ See [LICENSE](LICENSE) for the full license text.
 ## Features
 
 ### Compliance Testing
-- **MCP Compliance** — validate MCP server implementations against the official specification. The scanner negotiates the latest revision (`2025-06-18`) and flags servers that downgrade to **deprecated revisions** (`2024-11-05`, `2025-03-26`) that predate the OAuth Resource Server model and Resource Indicators (RFC 8707). Checks protocol version, capabilities, required methods, and echoes the `MCP-Protocol-Version` header on subsequent requests.
+- **MCP Compliance** — validate MCP server implementations against the official specification, currently [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28). That revision turned MCP into a **stateless request/response protocol**, so the scanner is dual-era: it probes `server/discover` at the current revision first and falls back to the `initialize` handshake only for servers on `2025-11-25` and earlier, then grades each server against the rules for its own era.
+
+  | Era | What is checked |
+  |-----|-----------------|
+  | Stateless (`2026-07-28`) | `server/discover` is implemented (a MUST) and advertises `supportedVersions`; server identity in each result's `_meta`; required `resultType` on results; `ttlMs` + `cacheScope` cache hints on `tools/list`; server-side validation of the mirrored `Mcp-Method` / `Mcp-Name` headers (expects `400` + `HeaderMismatch` `-32020`); statelessness (no `Mcp-Session-Id` minted, `GET` not served); deprecated Roots / Sampling / Logging capabilities |
+  | Handshake (`≤ 2025-11-25`) | `initialize` and `notifications/initialized`, `ping`, capabilities, server info — plus a warning that the revision is superseded, and whether the server also answers `server/discover` (dual-era) |
+
+  Both eras are checked for **deprecated revisions** (`2024-11-05`, `2025-03-26`) that predate the OAuth Resource Server model and Resource Indicators (RFC 8707).
 - **A2A Compliance** — verify A2A agent cards against the current spec (`0.3.0`). Resolves the canonical `/.well-known/agent-card.json` (with legacy `/.well-known/agent.json` fallback) and validates required fields, `protocolVersion`, skills, input/output modes, capabilities, **transport declarations** (`preferredTransport`/`additionalInterfaces`: JSONRPC, GRPC, HTTP+JSON), modern **`securitySchemes`/`security`** (with legacy `authentication` fallback), and **JWS card signatures** (`AgentCardSignature`).
 - **UCP Compliance** — 18 compliance rules validating UCP business profiles against the [published specification](https://ucp.dev/latest/specification/overview) (profile structure, services, capabilities, transport bindings, signing keys, vendor namespaces)
 
 ### Interactive Testing
-- **MCP Tool Explorer** — list all available tools on an MCP server and call any tool with custom arguments
+- **MCP Tool Explorer** — list all available tools on an MCP server and call any tool with custom arguments. Calls are made in the server's own era: against a stateless server the explorer mirrors `Mcp-Method`, `Mcp-Name` and any `x-mcp-header`-annotated parameters into HTTP headers, rejects tools whose annotations violate the spec, and surfaces a multi round-trip `input_required` result (with its `inputRequests`) instead of treating it as tool output
 - **A2A Skill Browser** — fetch agent cards, browse declared skills with tags/examples, and send tasks to agents
 
 ### Security Scanning
@@ -42,8 +49,14 @@ See [LICENSE](LICENSE) for the full license text.
 
   | Check | What is evaluated |
   |-------|-------------------|
-  | Protocol version | Negotiated revision is current; deprecated revisions (no Resource Indicators / OAuth Resource Server model) are flagged |
+  | Protocol version | Negotiated revision is current; deprecated revisions (no Resource Indicators / OAuth Resource Server model) are flagged, as is a superseded handshake-era revision and a stateless server that does not answer `server/discover` |
   | OAuth 2.1 metadata | Probes `/.well-known/oauth-protected-resource` (RFC 9728) and inspects the `WWW-Authenticate` challenge for a `resource_metadata` pointer; flags openly-accessible servers |
+  | Authorization server | Fetches the authorization server's metadata and flags missing **RFC 9207** issuer identification (`authorization_response_iss_parameter_supported`, the mix-up defence) and reliance on **deprecated Dynamic Client Registration** where **Client ID Metadata Documents** (`client_id_metadata_document_supported`) are not offered (2026-07-28) |
+  | Statelessness | Servers that still mint an `Mcp-Session-Id`, or still serve a standalone SSE stream on `GET`, after protocol-level sessions and the GET endpoint were removed (2026-07-28) |
+  | Deprecated features | Roots, Sampling and Logging capabilities, Deprecated as of 2026-07-28 with a twelve-month removal window |
+  | Header mirroring | `x-mcp-header` annotations that violate the spec's constraints (empty, non-token, CR/LF, duplicate, non-primitive, not statically reachable — such tools MUST be rejected by clients), and parameters mirrored into credential-shaped headers (`Authorization`, `Cookie`, API keys, forwarding headers) where the value becomes visible to every proxy on the path (2026-07-28) |
+  | Cache hints | `cacheScope: "public"` on an authenticated server — which lets a shared gateway serve one caller's response to another — and missing/invalid `ttlMs` + `cacheScope` on cacheable results (2026-07-28) |
+  | Schema supply chain | Network (`http(s)://`) `$ref` targets in tool `inputSchema`/`outputSchema`, which implementations MUST NOT dereference automatically (2026-07-28) |
   | Tool annotations | State-changing tools missing `ToolAnnotations`, and misleading `readOnlyHint` on mutating tools (2025-06-18+) |
   | Resources & prompts | `resources/list` and `prompts/list` are scanned for `file://` exposure, sensitive locations, and hidden-instruction / intent-subversion poisoning |
   | Lethal trifecta | Servers that co-locate untrusted-input ingestion, private-data access, and outbound communication (prompt-injection exfiltration risk) |

@@ -302,27 +302,99 @@ export function modernHeaders(
   return headers;
 }
 
-/** Parses a JSON or SSE response body into a JSON-RPC envelope. */
+/**
+ * Parses a JSON or SSE response body into a JSON-RPC envelope.
+ *
+ * The legacy Streamable HTTP / HTTP+SSE transports answer a POST on an
+ * `text/event-stream` that the server may hold open (Azure Functions' MCP
+ * extension does exactly this, and also mints an `Mcp-Session-Id`). Reading such
+ * a body with `response.text()` blocks until the stream closes, which never
+ * happens — so the stream is read incrementally and we return as soon as the
+ * first SSE message with a JSON-RPC payload arrives, then cancel the reader.
+ */
 export async function parseMCPResponse(response: Response): Promise<Json> {
   const contentType = response.headers.get('content-type') || '';
 
   if (contentType.includes('text/event-stream')) {
-    const text = await response.text();
-    const dataLine = text.split('\n').find((l) => l.startsWith('data:'));
-    if (dataLine) {
-      try {
-        return JSON.parse(dataLine.replace(/^data:\s*/, ''));
-      } catch {
-        return { _rawSSE: text };
-      }
-    }
-    return { _rawSSE: text };
+    return parseSSEFirstMessage(response);
   }
 
   try {
     return await response.json();
   } catch {
     return null;
+  }
+}
+
+/** Extracts the JSON payload of a single SSE event, or `undefined` if it has none. */
+function parseSSEEvent(rawEvent: string): Json | undefined {
+  const dataLines = rawEvent
+    .split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice('data:'.length).replace(/^ /, ''));
+  if (dataLines.length === 0) return undefined; // comment / keepalive / event-only frame
+
+  const payload = dataLines.join('\n');
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return { _rawSSE: payload };
+  }
+}
+
+/** Scans a fully-buffered SSE body for the first event carrying a data payload. */
+function extractSSEData(text: string): Json {
+  const normalized = text.replace(/\r\n/g, '\n');
+  for (const rawEvent of normalized.split('\n\n')) {
+    const parsed = parseSSEEvent(rawEvent);
+    if (parsed !== undefined) return parsed;
+  }
+  return { _rawSSE: text };
+}
+
+/**
+ * Reads an SSE response one event at a time and resolves with the first event
+ * that carries a JSON-RPC payload, without waiting for the stream to close.
+ */
+async function parseSSEFirstMessage(response: Response): Promise<Json> {
+  const body = response.body;
+  if (!body) {
+    // No readable stream in this environment — fall back to buffering.
+    return extractSSEData(await response.text());
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, '\n');
+
+      // SSE events are terminated by a blank line; process each complete one.
+      let boundary: number;
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const parsed = parseSSEEvent(rawEvent);
+        if (parsed !== undefined) return parsed;
+      }
+
+      if (done) {
+        const parsed = parseSSEEvent(buffer);
+        return parsed !== undefined ? parsed : { _rawSSE: buffer };
+      }
+    }
+  } catch (err) {
+    // Aborted or broke mid-stream — return anything already buffered.
+    const parsed = parseSSEEvent(buffer.replace(/\r\n/g, '\n'));
+    if (parsed !== undefined) return parsed;
+    throw err;
+  } finally {
+    // Releasing the reader closes the underlying connection.
+    reader.cancel().catch(() => undefined);
   }
 }
 

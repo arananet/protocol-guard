@@ -13,6 +13,7 @@ import {
   isModernResult,
   mcpNameFor,
   modernHeaders,
+  parseMCPResponse,
   withRequestMeta,
 } from '@/lib/mcp';
 
@@ -253,6 +254,64 @@ describe('modern envelope recognition', () => {
   });
 });
 
+// ─── SSE response parsing ────────────────────────────────────────────────────
+
+/** Builds an SSE Response from string chunks; `keepOpen` never closes the stream. */
+function sseResponse(chunks: string[], { keepOpen = false } = {}): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      if (!keepOpen) controller.close();
+    },
+  });
+  return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+}
+
+const RPC_FRAME =
+  'event: message\ndata: {"jsonrpc":"2.0","id":"1","result":{"serverInfo":{"name":"internal-mcp-server","version":"0.1.0"}}}\n\n';
+
+describe('SSE response parsing', () => {
+  it('parses a single inline event', async () => {
+    const raw = await parseMCPResponse(sseResponse([RPC_FRAME]));
+    expect(raw.result.serverInfo.name).toBe('internal-mcp-server');
+  });
+
+  it('returns on the first message without waiting for the stream to close', async () => {
+    // The Azure Functions MCP extension answers on a stream it holds open; if the
+    // parser waited for EOF this would hang until the test timed out.
+    const raw = await parseMCPResponse(sseResponse([RPC_FRAME], { keepOpen: true }));
+    expect(raw.id).toBe('1');
+  });
+
+  it('reassembles an event split across chunks', async () => {
+    const mid = Math.floor(RPC_FRAME.length / 2);
+    const raw = await parseMCPResponse(
+      sseResponse([RPC_FRAME.slice(0, mid), RPC_FRAME.slice(mid)])
+    );
+    expect(raw.result.serverInfo.version).toBe('0.1.0');
+  });
+
+  it('skips keepalive/comment frames and returns the first data frame', async () => {
+    const raw = await parseMCPResponse(sseResponse([': keepalive\n\n', 'event: ping\n\n', RPC_FRAME]));
+    expect(raw.result).toBeDefined();
+  });
+
+  it('handles CRLF line endings', async () => {
+    const raw = await parseMCPResponse(sseResponse([RPC_FRAME.replace(/\n/g, '\r\n')]));
+    expect(raw.id).toBe('1');
+  });
+
+  it('still parses a plain JSON response', async () => {
+    const raw = await parseMCPResponse(
+      new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+        headers: { 'content-type': 'application/json' },
+      })
+    );
+    expect(raw.result.ok).toBe(true);
+  });
+});
+
 // ─── Era detection ───────────────────────────────────────────────────────────
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}) {
@@ -407,6 +466,59 @@ describe('connectMCP era detection', () => {
     expect(conn.era).toBe('modern');
     expect(conn.probe.discoverImplemented).toBe(false);
     expect(conn.probe.fellBackToInitialize).toBe(false);
+  });
+
+  it('connects to a legacy SSE server that answers on a held-open stream with a session', async () => {
+    // Reproduces the Azure Functions MCP extension: text/event-stream responses,
+    // an Mcp-Session-Id header, and no server/discover support (2024-11-05).
+    const seen: Array<{ method: string; sessionHeader?: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: any) => {
+        const body = JSON.parse(init.body);
+        seen.push({ method: body.method, sessionHeader: init.headers['Mcp-Session-Id'] });
+
+        const sse = (payload: object, keepOpen = true) => {
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(`event: message\ndata: ${JSON.stringify(payload)}\n\n`)
+              );
+              if (!keepOpen) controller.close();
+            },
+          });
+          return new Response(stream, {
+            headers: { 'content-type': 'text/event-stream', 'mcp-session-id': 'sess-azure-1' },
+          });
+        };
+
+        if (body.method === 'server/discover' || body.method === 'tools/list') {
+          return sse({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'Method not found' } });
+        }
+        if (body.method === 'initialize') {
+          return sse({
+            jsonrpc: '2.0',
+            id: body.id,
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: { logging: {}, resources: {}, tools: {} },
+              serverInfo: { name: 'internal-mcp-server', version: '0.1.0' },
+            },
+          });
+        }
+        return sse({ jsonrpc: '2.0', id: body.id, result: {} });
+      })
+    );
+
+    const conn = await connectMCP('https://example.test/runtime/webhooks/mcp', {});
+
+    expect(conn.era).toBe('legacy');
+    expect(conn.protocolVersion).toBe('2024-11-05');
+    expect(conn.serverInfo).toEqual({ name: 'internal-mcp-server', version: '0.1.0' });
+    expect(conn.sessionId).toBe('sess-azure-1');
+    // The initialized notification must carry the minted session id.
+    const notify = seen.find((s) => s.method === 'notifications/initialized');
+    expect(notify?.sessionHeader).toBe('sess-azure-1');
   });
 
   it('reports an unknown era when the server answers nothing', async () => {

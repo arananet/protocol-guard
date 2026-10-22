@@ -1,5 +1,17 @@
 # Protocol Guard: migración de Railway a Cloudflare Containers
 
+## Despliegue (Workers Builds, configurado el 2026-10-22)
+
+- Proyecto Workers Builds sobre este repo, rama de producción `main`.
+- Root directory: `apps/cf-worker` (ahí vive el wrangler.jsonc del envoltorio).
+- Build command: vacío. La app se compila dentro de la imagen Docker durante
+  el deploy; la carpeta del envoltorio no tiene script de build.
+- Deploy command: `npx wrangler deploy`.
+- La imagen se construye desde `docker/Dockerfile` con la raíz del monorepo
+  como contexto (campo image_build_context del wrangler.jsonc).
+- Sin secretos en el repo: la app es stateless y no requiere variables.
+
+
 Estado: auditoría completada el 2026-10-22. Ruta decidida por Edu el 2026-10-22:
 Containers con el Dockerfile actual, sin reescribir código (lo que ya es Node o
 Next no se reescribe, solo se reempaqueta). Edu borró el proyecto de Railway, así

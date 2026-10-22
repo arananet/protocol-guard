@@ -11,6 +11,15 @@
   como contexto (campo image_build_context del wrangler.jsonc).
 - Sin secretos en el repo: la app es stateless y no requiere variables.
 
+## Verificación tras el despliegue
+
+1. `https://protocol-guard.info-693.workers.dev` responde 200 (arranque en
+   frío del contenedor, puede tardar unos segundos la primera vez).
+2. Con el dominio enganchado, `https://protocol-guard.arananet.net` responde
+   200 y sin cabeceras `x-railway-*`.
+3. Un escaneo de prueba contra un servidor MCP público devuelve resultados
+   por las rutas /api/mcp/*.
+
 
 Estado: auditoría completada el 2026-10-22. Ruta decidida por Edu el 2026-10-22:
 Containers con el Dockerfile actual, sin reescribir código (lo que ya es Node o

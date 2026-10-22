@@ -162,10 +162,13 @@ A2A (Agent2Agent):
   -32006 InvalidAgentResponseError, -32007
   ExtendedAgentCardNotConfiguredError, -32008 ExtensionSupportRequiredError
   y -32009 VersionNotSupportedError, además de los estándar JSON-RPC.
-- Compatibilidad: se conservan `sendTask`, `getTask` y `cancelTask` como
-  adaptadores marcados @deprecated sobre el nuevo transporte, traduciendo
-  las formas antiguas (parts con `type`, estados en minúscula) a las de
-  1.0 y de vuelta. Los tipos antiguos quedan exportados con @deprecated.
+- Compatibilidad: `sendTask` se conserva como adaptador @deprecated
+  sobre el nuevo transporte, traduciendo las formas antiguas (parts con
+  `type`, estados en minúscula) a las de 1.0 y de vuelta. `getTask` y
+  `cancelTask` pasan a ser las operaciones 1.0 (params compatibles con
+  los antiguos, pero devuelven la Task completa), y las formas antiguas
+  quedan como `getTaskLegacy` y `cancelTaskLegacy`. Los tipos antiguos
+  quedan exportados con @deprecated.
 - El checker gana una regla `agent-card-interfaces`: interfaces presentes
   con `protocolBinding` y `protocolVersion`; `protocolVersion` a nivel de
   card sigue como aviso porque en 1.0 la versión vive en cada interfaz.

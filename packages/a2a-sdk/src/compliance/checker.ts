@@ -33,16 +33,48 @@ export const A2A_COMPLIANCE_RULES: ComplianceRule[] = [
   {
     id: 'agent-card-url',
     name: 'Agent URL',
-    description: 'Agent card must have a valid URL',
+    description: 'Agent card must expose at least one valid interface URL (or a legacy card url)',
     severity: 'critical',
     check: (agentCard) => {
-      const hasUrl = !!agentCard.url;
-      const isValidUrl = hasUrl ? isValidURL(agentCard.url) : false;
+      const urls = (agentCard.supportedInterfaces || []).map(i => i.url).filter(Boolean);
+      if (agentCard.url) urls.push(agentCard.url);
+      const valid = urls.filter(isValidURL);
       return {
-        passed: isValidUrl,
+        passed: valid.length > 0,
         ruleId: 'agent-card-url',
-        message: isValidUrl ? 'Agent URL valid' : 'Missing or invalid agent URL',
+        message: valid.length > 0
+          ? `${valid.length} valid interface URL(s)`
+          : 'Missing or invalid agent URL',
         severity: 'critical' as const,
+      };
+    },
+  },
+  {
+    id: 'agent-card-interfaces',
+    name: 'Supported Interfaces (1.0)',
+    description: 'A2A 1.0 cards declare supportedInterfaces, each with url, protocolBinding and protocolVersion',
+    severity: 'warning',
+    check: (agentCard) => {
+      const interfaces = agentCard.supportedInterfaces || [];
+      if (interfaces.length === 0) {
+        return {
+          passed: false,
+          ruleId: 'agent-card-interfaces',
+          message: agentCard.url
+            ? 'No supportedInterfaces declared (pre-1.0 card shape with a single url)'
+            : 'No supportedInterfaces declared',
+          severity: 'warning' as const,
+        };
+      }
+      const incomplete = interfaces.filter(i => !i.url || !i.protocolBinding || !i.protocolVersion);
+      return {
+        passed: incomplete.length === 0,
+        ruleId: 'agent-card-interfaces',
+        message: incomplete.length === 0
+          ? `${interfaces.length} interface(s): ${interfaces.map(i => `${i.protocolBinding}@${i.protocolVersion}`).join(', ')}`
+          : `${incomplete.length} interface(s) missing url, protocolBinding or protocolVersion`,
+        severity: 'warning' as const,
+        details: { count: interfaces.length, incomplete: incomplete.length },
       };
     },
   },
@@ -109,25 +141,41 @@ export const A2A_COMPLIANCE_RULES: ComplianceRule[] = [
   {
     id: 'agent-card-protocol-version',
     name: 'Protocol Version',
-    description: 'Agent card should declare the A2A protocolVersion',
+    description: 'In A2A 1.0 each interface declares its protocolVersion; a card-level protocolVersion is the pre-1.0 location',
     severity: 'warning',
-    check: (agentCard) => ({
-      passed: !!agentCard.protocolVersion,
-      ruleId: 'agent-card-protocol-version',
-      message: agentCard.protocolVersion
-        ? `Protocol version: ${agentCard.protocolVersion}`
-        : 'No protocolVersion declared (current A2A spec expects one)',
-      severity: 'warning' as const,
-    }),
+    check: (agentCard) => {
+      const ifaceVersions = (agentCard.supportedInterfaces || [])
+        .map(i => i.protocolVersion)
+        .filter(Boolean) as string[];
+      if (ifaceVersions.length > 0) {
+        const current = ifaceVersions.filter(v => v === '1.0' || v.startsWith('1.'));
+        return {
+          passed: true,
+          ruleId: 'agent-card-protocol-version',
+          message: `Interface protocol version(s): ${[...new Set(ifaceVersions)].join(', ')}${current.length === 0 ? ' (no 1.x interface)' : ''}`,
+          severity: 'warning' as const,
+          details: { versions: ifaceVersions },
+        };
+      }
+      return {
+        passed: !!agentCard.protocolVersion,
+        ruleId: 'agent-card-protocol-version',
+        message: agentCard.protocolVersion
+          ? `Protocol version (card-level, pre-1.0 location): ${agentCard.protocolVersion}`
+          : 'No protocolVersion declared on card or interfaces',
+        severity: 'warning' as const,
+      };
+    },
   },
   {
     id: 'agent-card-authentication',
     name: 'Security Schemes',
-    description: 'Agent card must declare security schemes (securitySchemes/security) or legacy authentication',
+    description: 'Agent card must declare security schemes (securitySchemes/securityRequirements) or legacy authentication',
     severity: 'critical',
     check: (agentCard) => {
       const hasModern =
         (!!agentCard.securitySchemes && Object.keys(agentCard.securitySchemes).length > 0) ||
+        (Array.isArray(agentCard.securityRequirements) && agentCard.securityRequirements.length > 0) ||
         (Array.isArray(agentCard.security) && agentCard.security.length > 0);
       const hasLegacy = !!agentCard.authentication?.schemes?.length;
       const hasAuth = hasModern || hasLegacy;
@@ -161,7 +209,7 @@ export const A2A_COMPLIANCE_RULES: ComplianceRule[] = [
         ruleId: 'agent-card-signature',
         message: signed
           ? `Agent card is JWS-signed (${agentCard.signatures!.length} signature(s))`
-          : 'Agent card is not signed — clients cannot verify integrity',
+          : 'Agent card is not signed: clients cannot verify integrity',
         severity: 'info' as const,
       };
     },
@@ -233,7 +281,7 @@ export async function checkA2ACompliance(
     timestamp: new Date(),
     agentId,
     agentName: agentCard.name,
-    agentCardUrl: agentCard.url,
+    agentCardUrl: agentCard.supportedInterfaces?.[0]?.url || agentCard.url || '',
     results,
     passedCount,
     failedCount,
